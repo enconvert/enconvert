@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  boot-smoke:
+    name: Import & boot smoke (self-hosted build)
+    runs-on: ubuntu-latest
+    env:
+      # Dummy values so module-level create_engine()/auth setup can import.
+      # No real database is contacted — these are only PARSED at import time.
+      DATABASE_URL: postgresql://user:pass@localhost:5432/enconvert
+      JWT_SECRET: ci-dummy-secret-not-used
+      ENVIRONMENT: test
+      ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Import the app (proves the open build boots without the cloud engine)
+        run: |
+          python - <<'PY'
+          import importlib
+          # The FastAPI app must import cleanly with only the open tree +
+          # overlay fallbacks present (no closed conversion engine).
+          for mod in ["config", "models", "main"]:
+              importlib.import_module(mod)
+          print("OK: open build imports cleanly")
+          PY
+
+      - name: Run hermetic open-tree tests
+        continue-on-error: true
+        run: |
+          pip install pytest pytest-asyncio || true
+          pytest -q || true

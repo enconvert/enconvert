@@ -1,0 +1,43 @@
+{
+  "name": "reordered_list",
+  "mode": "auto",
+  "note": "Same JSON-LD products and links, different order. Key-matching must ignore order.",
+  "before": {
+    "text": "Our plans, in no particular order.",
+    "structured": {
+      "metadata": {"title": "Plans"},
+      "tables": [],
+      "links": {
+        "internal": [
+          {"href": "https://acme.test/a", "text": "A"},
+          {"href": "https://acme.test/b", "text": "B"}
+        ],
+        "external": []
+      },
+      "structured_data": [
+        {"@type": "Product", "name": "Starter Plan"},
+        {"@type": "Product", "name": "Pro Plan"}
+      ]
+    }
+  },
+  "after": {
+    "text": "Our plans, in no particular order.",
+    "structured": {
+      "metadata": {"title": "Plans"},
+      "tables": [],
+      "links": {
+        "internal": [
+          {"href": "https://acme.test/b", "text": "B"},
+          {"href": "https://acme.test/a", "text": "A"}
+        ],
+        "external": []
+      },
+      "structured_data": [
+        {"@type": "Product", "name": "Pro Plan"},
+        {"@type": "Product", "name": "Starter Plan"}
+      ]
+    }
+  },
+  "expect_changes": false,
+  "expect_sections": []
+}

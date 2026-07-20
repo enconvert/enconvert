@@ -1,0 +1,10 @@
+Sprint F.8 live verification (no-GCP in-process worker)
+{
+  "inline_5": {
+    "elapsed_s": 103.1
+  },
+  "async_11": {
+    "elapsed_s": 297.6,
+    "per_url_s": 27.1
+  }
+}

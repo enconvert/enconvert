@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>F3 Static Fixture - Home</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; margin: 40px; color: #1a1a2e; }
+  header { border-bottom: 2px solid #2e8b57; padding-bottom: 12px; }
+  nav a { margin-right: 16px; color: #2e8b57; }
+  .card { border: 1px solid #ccc; padding: 16px; margin: 12px 0; }
+  footer { margin-top: 48px; font-size: 12px; color: #555; }
+</style>
+</head>
+<body>
+<header>
+  <h1>F3-STATIC-INDEX-SENTINEL</h1>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="about.html">About</a>
+    <a href="pricing.html">Pricing</a>
+  </nav>
+</header>
+<main>
+  <p>Deterministic multi-page static site fixture for the Sprint F.3
+  website-to-pdf byte-identity tests. This page must render identically on
+  every run: no scripts, no external resources, no dates, no randomness.</p>
+  <div class="card">
+    <h2>Conversion engine</h2>
+    <p>Files are processed through the API gateway and rendered by a single
+    shared Chromium instance. Every discovered page becomes one render call
+    through the singleton.</p>
+  </div>
+  <div class="card">
+    <h2>Discovery</h2>
+    <p>URL discovery walks robots.txt, sitemaps, and same-domain links in
+    breadth-first order, deduplicating normalized URLs along the way.</p>
+  </div>
+  <ul>
+    <li>Alpha entry one</li>
+    <li>Beta entry two</li>
+    <li>Gamma entry three</li>
+    <li>Delta entry four</li>
+  </ul>
+</main>
+<footer>F3 fixture footer - home page</footer>
+</body>
+</html>

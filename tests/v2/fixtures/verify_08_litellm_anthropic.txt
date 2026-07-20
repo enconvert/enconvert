@@ -1,0 +1,58 @@
+Sprint F0.5 - verification item 8: LLMExtractionStrategy + anthropic/claude-haiku-4-5 via litellm
+Date measured: 2026-06-06 07:44 UTC
+Environment: macOS, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, unclecode-litellm==1.81.13, anthropic==0.105.2
+
+Method:
+  Check 1 (offline) -- litellm.model_cost and get_model_info/get_llm_provider registry lookup
+  Check 2 (offline) -- LLMExtractionStrategy constructor: deprecated provider= vs LLMConfig form
+  Check 3 (keyed) -- call strat.extract() on inline HTML fixture and classify result
+
+
+========================================================================
+Check 1: litellm model registry
+========================================================================
+  Slug under test: anthropic/claude-haiku-4-5
+  litellm package  : unclecode-litellm 1.81.13
+  model_cost[claude-haiku-4-5] present: True
+  model_cost provider field : anthropic
+  model_cost mode           : chat
+  model_cost max_tokens      : 64000
+  get_model_info OK          : True
+  get_model_info provider    : anthropic
+  get_model_info mode        : chat
+  get_llm_provider tuple     : ['claude-haiku-4-5', 'anthropic', None, None]
+  routed provider            : anthropic
+  Result: PASS -- Slug resolves; model_cost key present; routes to anthropic provider.
+
+========================================================================
+Check 2: LLMExtractionStrategy constructor
+========================================================================
+  Deprecated form (provider=, api_token=) blocked: True
+  Deprecated error message: Setting 'provider' is deprecated. Instead, use llm_config=LLMConfig(provider="...")
+  Correct form (llm_config=LLMConfig(...)) accepted: True
+  Correct form provider stored  : anthropic/claude-haiku-4-5
+  Correct form extract_type     : block
+  Correct form input_format     : html
+  Result: PASS -- Deprecated form correctly blocked; LLMConfig form accepted.
+
+========================================================================
+Check 3: live extraction
+========================================================================
+  ANTHROPIC_API_KEY present: True
+  Wall time              : 4.421 s
+  Blocks returned        : 3
+  First block has error  : False
+  First block content    : ['Product Catalogue']
+  Token usage: prompt=787, completion=133, total=920
+  Result: PASS -- Extraction succeeded; structured result returned; litellm bridge confirmed PASS.
+
+========================================================================
+SUMMARY
+========================================================================
+  Check 1 (registry)    : PASS
+  Check 2 (constructor) : PASS
+  Check 3 (keyed)     : PASS
+
+Status: PASS
+DECISION: litellm bridge selected -- anthropic/claude-haiku-4-5 routes end-to-end.

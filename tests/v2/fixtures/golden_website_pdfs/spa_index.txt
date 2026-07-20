@@ -1,0 +1,8 @@
+F3-SPA-RENDERED-SENTINEL
+Client-rendered single page application fixture. The initial HTML contains only a loading shell; everything below is built by script after DOMContentLoaded.
+SPA item one
+SPA item two
+SPA item three
+SPA item four
+F3-SPA-LAZY-SENTINEL
+Lazy chunk appended 50 ms after the synchronous render. A correct render path waits long enough for this block to be in the PDF.

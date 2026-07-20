@@ -1,0 +1,28 @@
+Sprint F0.5 - verification item 10: capture V1 golden PDFs (5 URLs)
+Date recorded: 2026-06-06
+Environment: macOS, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, playwright==1.57.0
+
+Plan reference: section 12 item 10 ("Capture V1 golden PDFs (5 URLs) on
+pre-refactor code -> tests/v2/fixtures/"), marked in Task F0.5 step 8 as
+"done in F0.4".
+
+Observed repository state (verified 2026-06-06):
+  - Golden captures EXIST: tests/v2/fixtures/f03_sanity/baseline/ holds
+    5 URLs (example, wikipedia-pdf, github-crawl4ai, stripe-pricing,
+    python-org) captured 2026-06-05 through the full url_to_pdf pipeline,
+    with manifest.json recording page counts, byte sizes, and text sha256
+    per URL. A post-F0.3 "after" set exists alongside with page-count
+    parity and 0.9988-1.0000 text similarity.
+  - Task F0.4 formal deliverables DO NOT exist: no F0.4 commit on any
+    branch (git log --all --grep=F0.4 is empty; v1 HEAD is the F0.3
+    commit 31cbc76), no tests/v2/test_pdf_byte_identity.py, no memory
+    budget test, no regression suite. The fixture binaries are untracked
+    (kept out of git per repo binary-fixture rules).
+
+Status: PARTIAL
+  The SUBSTANCE of verification item 10 (golden 5-URL captures with a
+  comparison manifest) is satisfied by the F0.3 sanity baseline. The
+  Task F0.4 test-suite deliverables that the plan layers on top of those
+  captures have not been landed and must not be assumed present at the
+  Phase 0.5 exit gate. Flagged in VERIFICATION_REPORT.md.

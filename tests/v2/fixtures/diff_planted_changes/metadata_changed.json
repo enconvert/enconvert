@@ -1,0 +1,25 @@
+{
+  "name": "metadata_changed",
+  "mode": "auto",
+  "note": "Page title is updated; nothing else moves.",
+  "before": {
+    "text": "Welcome to our documentation hub.",
+    "structured": {
+      "metadata": {"title": "Docs", "description": "Developer documentation.", "og:type": "website"},
+      "tables": [],
+      "links": {"internal": [], "external": []},
+      "structured_data": []
+    }
+  },
+  "after": {
+    "text": "Welcome to our documentation hub.",
+    "structured": {
+      "metadata": {"title": "Docs 2025", "description": "Developer documentation.", "og:type": "website"},
+      "tables": [],
+      "links": {"internal": [], "external": []},
+      "structured_data": []
+    }
+  },
+  "expect_changes": true,
+  "expect_sections": ["metadata"]
+}

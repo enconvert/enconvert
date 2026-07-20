@@ -1,0 +1,734 @@
+"""Open-source fallback for the /v2/perceive flow.
+
+This module ships ONLY in the public mirror. The private/cloud build has the
+real perceive engine at this path (stealth ladder, page-quality chains,
+render-quality scoring, Tier-3 LLM extraction); the mirror replaces it with a
+plain headless-Chromium render that still produces the honest basics:
+markdown, cleaned/raw HTML, links, images, PDF, screenshots and heuristic
+structured extraction — persisted through the same open operations/usage/
+storage helpers, so the API contract (PerceiveResponse, GET status,
+batch worker) is unchanged.
+
+Capabilities that need the cloud engine (mobile emulation, action chains,
+geolocation, proxies, LLM schema extraction) raise ``CloudEngineRequired``
+(HTTP 501) instead of silently degrading.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
+
+from fastapi import HTTPException
+from playwright.async_api import (
+    Browser,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
+
+from api.v2.schemas.perceive import (
+    SUPPORTED_EXTRACTS,
+    OutputArtifact,
+    PerceiveAuth,
+    PerceiveRequest,
+    PerceiveResponse,
+    PerceiveTokens,
+)
+from models import PAGE_SIZES, PdfOptions, PerceiveOperation
+from services._engine_fallback import CloudEngineRequired
+from services.v2_engine import operations, usage
+from services.v2_engine.crawl4ai_processors import (
+    extract_headings,
+    extract_json_ld,
+    generate_fit_markdown,
+    generate_markdown_bytes,
+    scrap_html,
+    serialize_images,
+    serialize_links,
+    serialize_tables,
+)
+from services.v2_engine.url_safety import assert_public_http_url
+from utils.pdf_postprocess import convert_to_grayscale
+from utils.robots_parser import fetch_robots_info
+from utils.storage import generate_presigned_url, upload_to_gcs
+
+logger = logging.getLogger(__name__)
+
+V2_PERCEIVE_ENDPOINT = "v2-perceive"  # Spaces path segment
+
+_EXTENSIONS: dict[str, str] = {
+    "markdown": ".md",
+    "markdown_fit": ".md",
+    "html_cleaned": ".html",
+    "html_raw": ".html",
+    "screenshot": ".png",
+    "screenshot_full_page": ".png",
+    "pdf": ".pdf",
+    "links": ".json",
+    "images": ".json",
+}
+
+_CONTENT_TYPES: dict[str, str] = {
+    ".md": "text/markdown; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".png": "image/png",
+    ".pdf": "application/pdf",
+    ".json": "application/json",
+}
+
+# Default heuristic extraction when the caller asks for "structured"
+# output without an explicit extract[] list.
+_DEFAULT_EXTRACTS: tuple[str, ...] = ("metadata", "structured_data")
+
+_MAIN_CONTENT_MAX_CHARS = 50_000
+
+_GOTO_TIMEOUT_MS = int(os.environ.get("FALLBACK_GOTO_TIMEOUT_MS", "60000"))
+_SETTLE_TIMEOUT_MS = 5_000
+
+# ── Shared plain-Chromium browser (lazy singleton) ───────────────────────
+
+_playwright: Optional[Any] = None
+_browser: Optional[Browser] = None
+_browser_lock = asyncio.Lock()
+_render_semaphore = asyncio.Semaphore(
+    max(1, int(os.environ.get("FALLBACK_RENDER_CONCURRENCY", "1")))
+)
+
+
+async def _get_browser() -> Browser:
+    """Launch (or reuse) one plain headless Chromium for all renders."""
+    global _playwright, _browser
+    async with _browser_lock:
+        if _browser is not None and _browser.is_connected():
+            return _browser
+        if _playwright is None:
+            _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        return _browser
+
+
+def _reject_cloud_features(request: PerceiveRequest) -> None:
+    """Fail fast (501) on request knobs only the cloud engine serves."""
+    if request.mobile:
+        raise CloudEngineRequired("mobile emulation")
+    if request.extraction_schema is not None:
+        raise CloudEngineRequired("LLM schema extraction")
+    if request.action_chain:
+        raise CloudEngineRequired("browser action chains")
+    if request.geolocation is not None:
+        raise CloudEngineRequired("geolocation emulation")
+    if request.proxy_url is not None:
+        raise CloudEngineRequired("proxy routing")
+
+
+def _viewport(request: PerceiveRequest) -> tuple[int, int]:
+    if request.viewport is not None:
+        return request.viewport.width, request.viewport.height
+    if request.mobile:
+        return 390, 844
+    return 1920, 1080
+
+
+def _effective_extracts(request: PerceiveRequest) -> tuple[list[str], list[str]]:
+    """(supported extracts to run, warnings for unsupported ones)."""
+    if "structured" not in request.outputs:
+        return [], []
+    requested = list(request.extract) or list(_DEFAULT_EXTRACTS)
+    if "all" in requested:
+        requested = list(SUPPORTED_EXTRACTS) + [
+            name for name in requested if name != "all"
+        ]
+    seen: list[str] = []
+    warnings: list[str] = []
+    for name in requested:
+        if name in seen:
+            continue
+        if name in SUPPORTED_EXTRACTS:
+            seen.append(name)
+        else:
+            warnings.append(
+                f"extract '{name}' is not available in the self-hosted "
+                "build; omitted from structured."
+            )
+    return seen, warnings
+
+
+def _fingerprint(request: PerceiveRequest, outputs: list[str]) -> str:
+    """Cache key over the render-affecting request surface."""
+    cookies = request.cookies or []
+    sorted_cookies = sorted(
+        cookies,
+        key=lambda c: (str(c.get("name", "")), str(c.get("domain", ""))),
+    )
+    payload: dict[str, Any] = {
+        "url": str(request.url),
+        "outputs": sorted(outputs),
+        "extract": sorted(request.extract),
+        "schema": request.extraction_schema,
+        "pdf_options": request.pdf_options.model_dump()
+        if request.pdf_options
+        else None,
+        "viewport": request.viewport.model_dump() if request.viewport else None,
+        "mobile": request.mobile,
+        "js_code": request.js_code,
+        "wait_for": request.wait_for,
+        "wait_timeout_ms": request.wait_timeout_ms,
+        "block_resources": sorted(request.block_resources),
+        "headers": request.headers,
+        "cookies": sorted_cookies,
+        "auth": request.auth.model_dump() if request.auth else None,
+    }
+    return operations.request_fingerprint(payload)
+
+
+async def _check_robots(url: str) -> None:
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    info = await fetch_robots_info(origin)
+    if not info.can_fetch(url):
+        raise HTTPException(
+            status_code=403,
+            detail="robots.txt disallows fetching this URL "
+            "(request sent respect_robots=true).",
+        )
+
+
+async def _apply_wait_for(
+    page: Page, wait_for: str, timeout_ms: int, warnings: list[str]
+) -> None:
+    """Best-effort wait_for: a timeout degrades to a warning."""
+    try:
+        if wait_for.startswith("js:"):
+            await page.wait_for_function(wait_for[3:], timeout=timeout_ms)
+        else:
+            selector = wait_for[4:] if wait_for.startswith("css:") else wait_for
+            await page.wait_for_selector(selector, timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        warnings.append(
+            f"wait_for did not complete within {timeout_ms}ms; "
+            "captured the page as-is."
+        )
+
+
+def _artifact_filename(operation_id: str, name: str) -> str:
+    return f"{operation_id}_{name}{_EXTENSIONS[name]}"
+
+
+def _content_type_for(name: str) -> str:
+    return _CONTENT_TYPES[_EXTENSIONS[name]]
+
+
+def artifact_from_entry(
+    name: str, entry: Any, project_id: int
+) -> Optional[OutputArtifact]:
+    """Build an OutputArtifact (fresh signed URL) from an output_keys
+    entry. Shared with the GET status handler. Tolerates both the dict
+    shape and a bare object-key string."""
+    if isinstance(entry, dict):
+        key = entry.get("key")
+        size_bytes = int(entry.get("size_bytes", 0) or 0)
+        content_type = entry.get("content_type") or _CONTENT_TYPES.get(
+            _EXTENSIONS.get(name, ""), "application/octet-stream"
+        )
+    else:
+        key = entry
+        size_bytes = 0
+        content_type = "application/octet-stream"
+    if not key:
+        return None
+    try:
+        url = generate_presigned_url(key, str(project_id))
+    except Exception:  # noqa: BLE001 — a stale key must not 500 the GET
+        logger.warning("presign failed for %s", key, exc_info=True)
+        url = None
+    return OutputArtifact(
+        url=url,
+        object_key=key,
+        size_bytes=size_bytes,
+        content_type=content_type,
+    )
+
+
+def outputs_from_keys(
+    output_keys: Optional[dict[str, Any]], project_id: int
+) -> Dict[str, OutputArtifact]:
+    """Rebuild the response outputs map from a persisted row."""
+    result: Dict[str, OutputArtifact] = {}
+    for name, entry in (output_keys or {}).items():
+        if name.startswith("_"):
+            continue
+        artifact = artifact_from_entry(name, entry, project_id)
+        if artifact is not None:
+            result[name] = artifact
+    return result
+
+
+# ── Rendering ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _Captured:
+    """What one plain render produced (mirror of the closed RenderResult
+    surface that ``_process_outputs`` reads)."""
+
+    html: str
+    final_url: str
+    pdf_bytes: Optional[bytes] = None
+    screenshot_bytes: Optional[bytes] = None
+    screenshot_viewport_bytes: Optional[bytes] = None
+
+
+def _pdf_kwargs(pdf_options: Optional[PdfOptions]) -> dict[str, Any]:
+    """Map the public PdfOptions surface onto ``page.pdf`` kwargs."""
+    if pdf_options is None:
+        return {"format": "A4", "print_background": True}
+    kwargs: dict[str, Any] = {
+        "print_background": True,
+        "landscape": pdf_options.orientation == "landscape",
+        "scale": pdf_options.scale,
+        "margin": {
+            "top": f"{pdf_options.margins.top}mm",
+            "bottom": f"{pdf_options.margins.bottom}mm",
+            "left": f"{pdf_options.margins.left}mm",
+            "right": f"{pdf_options.margins.right}mm",
+        },
+    }
+    if pdf_options.page_width and pdf_options.page_height:
+        kwargs["width"] = f"{pdf_options.page_width}mm"
+        kwargs["height"] = f"{pdf_options.page_height}mm"
+    elif pdf_options.page_size in PAGE_SIZES:
+        width_mm, height_mm = PAGE_SIZES[pdf_options.page_size]
+        kwargs["width"] = f"{width_mm}mm"
+        kwargs["height"] = f"{height_mm}mm"
+    return kwargs
+
+
+async def _render_basic(
+    request: PerceiveRequest, url: str, outputs: list[str]
+) -> tuple[_Captured, list[str]]:
+    """One plain-Chromium render: goto + content/pdf/screenshot.
+
+    No stealth, no quality chains, no engine ladder — this is the honest
+    open-source render path.
+    """
+    warnings: list[str] = []
+    browser = await _get_browser()
+    width, height = _viewport(request)
+
+    context_kwargs: dict[str, Any] = {
+        "viewport": {"width": width, "height": height}
+    }
+    if request.headers:
+        context_kwargs["extra_http_headers"] = dict(request.headers)
+    if request.auth is not None:
+        context_kwargs["http_credentials"] = {
+            "username": request.auth.username,
+            "password": request.auth.password,
+        }
+
+    async with _render_semaphore:
+        context = await browser.new_context(**context_kwargs)
+        try:
+            if request.cookies:
+                try:
+                    await context.add_cookies(list(request.cookies))
+                except Exception as exc:  # noqa: BLE001 — degrade, don't fail
+                    warnings.append(f"cookies could not be applied: {exc}")
+
+            page = await context.new_page()
+
+            blocked_types = set(request.block_resources)
+            if blocked_types:
+
+                async def _block(route: Any) -> None:
+                    if route.request.resource_type in blocked_types:
+                        await route.abort()
+                    else:
+                        await route.fallback()
+
+                await page.route("**/*", _block)
+
+            try:
+                await page.goto(url, wait_until="load", timeout=_GOTO_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                warnings.append(
+                    "page load timed out; captured the page as-is."
+                )
+
+            if request.js_code:
+                try:
+                    await page.evaluate(request.js_code)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"js_code raised: {exc}")
+            if request.wait_for:
+                await _apply_wait_for(
+                    page, request.wait_for, request.wait_timeout_ms, warnings
+                )
+            # Give late JS a short, bounded settle window.
+            try:
+                await page.wait_for_load_state(
+                    "networkidle", timeout=_SETTLE_TIMEOUT_MS
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            html = await page.content()
+            final_url = page.url
+
+            pdf_bytes: Optional[bytes] = None
+            ss_full: Optional[bytes] = None
+            ss_viewport: Optional[bytes] = None
+            if "pdf" in outputs:
+                pdf_bytes = await page.pdf(**_pdf_kwargs(request.pdf_options))
+            if "screenshot" in outputs:
+                ss_viewport = await page.screenshot(full_page=False, type="png")
+            if "screenshot_full_page" in outputs:
+                ss_full = await page.screenshot(full_page=True, type="png")
+
+            return (
+                _Captured(
+                    html=html,
+                    final_url=final_url,
+                    pdf_bytes=pdf_bytes,
+                    screenshot_bytes=ss_full,
+                    screenshot_viewport_bytes=ss_viewport,
+                ),
+                warnings,
+            )
+        finally:
+            await context.close()
+
+
+@dataclass(frozen=True)
+class RenderedPage:
+    """The DOM from one lightweight render (open-fallback shape).
+
+    Same public fields the distill/ingest/watch flows read. The open build
+    has no render-quality scorer, so ``render_quality`` is a coarse
+    non-empty-DOM heuristic and ``is_blocked`` is always False.
+    """
+
+    html: str
+    final_url: str
+    render_quality: float
+    is_blocked: bool
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+
+async def render_html(
+    url: str,
+    *,
+    respect_robots: bool = False,
+    wait_for: Optional[str] = None,
+    wait_timeout_ms: int = 30000,
+    headers: Optional[dict[str, str]] = None,
+    cookies: Optional[list[dict[str, Any]]] = None,
+    auth: Optional[dict[str, Any]] = None,
+) -> RenderedPage:
+    """Render one URL to HTML — no persistence, no quota, no uploads.
+
+    The lightweight render entry point distill/ingest/watch depend on.
+    Raises (RuntimeError / HTTPException) on a failed render exactly like
+    ``run`` does; callers catch per URL.
+    """
+    clean = url.strip()
+    await assert_public_http_url(clean)
+    if respect_robots:
+        await _check_robots(clean)
+
+    request = PerceiveRequest(
+        url=clean,
+        outputs=["html_raw"],
+        wait_for=wait_for,
+        wait_timeout_ms=wait_timeout_ms,
+        headers=headers,
+        cookies=cookies,
+        auth=PerceiveAuth(**auth) if auth else None,
+        cache_mode="bypass",
+    )
+    captured, warnings = await _render_basic(request, clean, ["html_raw"])
+    if not captured.html:
+        raise RuntimeError(f"render captured no HTML for {clean}")
+    return RenderedPage(
+        html=captured.html,
+        final_url=captured.final_url or clean,
+        render_quality=1.0 if len(captured.html) > 500 else 0.5,
+        is_blocked=False,
+        warnings=tuple(warnings),
+    )
+
+
+# ── /v2/perceive orchestration ───────────────────────────────────────────
+
+
+async def run(
+    request: PerceiveRequest,
+    operation_id: str,
+    user: dict,
+    batch_id: Optional[str] = None,
+) -> PerceiveResponse:
+    """Execute one /v2/perceive operation end-to-end (basic path).
+
+    Renders (or serves from the 1 h cache), processes outputs, uploads
+    artifacts, persists ch_perceive_operations, bumps the V2 usage
+    counter, and returns the standard response. Cloud-only request knobs
+    raise ``CloudEngineRequired`` before any row is written.
+    """
+    start = time.monotonic()
+    project_id = int(user["id"])
+    url = str(request.url)
+    outputs = list(dict.fromkeys(request.outputs))
+
+    _reject_cloud_features(request)
+    await assert_public_http_url(url)
+    if request.respect_robots:
+        await _check_robots(url)
+
+    extracts, warnings = _effective_extracts(request)
+    fingerprint = _fingerprint(request, outputs)
+
+    if request.cache_mode == "enabled":
+        cached = operations.find_cached_operation(
+            project_id=project_id, url=url, fingerprint=fingerprint
+        )
+        if cached is not None:
+            try:
+                return _serve_from_cache(
+                    cached, operation_id, project_id, url, outputs, start,
+                    batch_id=batch_id,
+                )
+            except Exception as exc:
+                operations.fail_operation(
+                    operation_id=operation_id,
+                    error_message=str(exc),
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+                raise
+
+    operations.create_operation(
+        operation_id=operation_id,
+        project_id=project_id,
+        url=url,
+        outputs_requested=outputs,
+        batch_id=batch_id,
+    )
+
+    try:
+        captured, render_warnings = await _render_basic(request, url, outputs)
+        warnings.extend(render_warnings)
+        if not captured.html:
+            raise RuntimeError(f"/v2/perceive render captured no HTML for {url}")
+        if "pdf" in outputs and captured.pdf_bytes is None:
+            raise RuntimeError(f"/v2/perceive produced no PDF for {url}")
+
+        artifacts, structured = await asyncio.to_thread(
+            _process_outputs, request, outputs, extracts, captured, warnings
+        )
+        if (
+            "pdf" in artifacts
+            and request.pdf_options
+            and request.pdf_options.grayscale
+        ):
+            artifacts["pdf"] = await convert_to_grayscale(artifacts["pdf"])
+
+        uploads = await _upload_artifacts(artifacts, operation_id, project_id)
+
+        content_hash = hashlib.sha256(
+            captured.html.encode("utf-8")
+        ).hexdigest()
+        duration_ms = int((time.monotonic() - start) * 1000)
+        output_keys: dict[str, Any] = dict(uploads)
+        output_keys[operations.FINGERPRINT_KEY] = fingerprint
+
+        operations.complete_operation(
+            operation_id=operation_id,
+            url_final=captured.final_url,
+            content_hash=content_hash,
+            output_keys=output_keys,
+            structured_data=structured,
+            extraction_tier="heuristic",
+            cache_hit=False,
+            duration_ms=duration_ms,
+        )
+        usage.increment_perceive_usage(project_id)
+        usage.record_storage_and_retention(
+            project_id, uploads, user.get("subscription", {})
+        )
+
+        return PerceiveResponse(
+            operation_id=operation_id,
+            status="completed",
+            url=url,
+            url_final=captured.final_url,
+            content_hash=content_hash,
+            render_quality=None,
+            cache_hit=False,
+            outputs=outputs_from_keys(output_keys, project_id),
+            structured=structured,
+            extraction_tier="heuristic",
+            tokens=PerceiveTokens(),
+            cost_cents=0.0,
+            duration_ms=duration_ms,
+            warnings=warnings,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        operations.fail_operation(
+            operation_id=operation_id,
+            error_message=str(exc),
+            duration_ms=duration_ms,
+        )
+        raise
+
+
+def _serve_from_cache(
+    cached: PerceiveOperation,
+    operation_id: str,
+    project_id: int,
+    url: str,
+    outputs: list[str],
+    start: float,
+    batch_id: Optional[str] = None,
+) -> PerceiveResponse:
+    """Record a cache-hit operation and answer from the cached row."""
+    operations.create_operation(
+        operation_id=operation_id,
+        project_id=project_id,
+        url=url,
+        outputs_requested=outputs,
+        batch_id=batch_id,
+    )
+    duration_ms = int((time.monotonic() - start) * 1000)
+    operations.complete_operation(
+        operation_id=operation_id,
+        url_final=cached.url_final,
+        content_hash=cached.content_hash,
+        output_keys=cached.output_keys or {},
+        structured_data=cached.structured_data,
+        extraction_tier=cached.extraction_tier,
+        cache_hit=True,
+        duration_ms=duration_ms,
+        render_quality_score=cached.render_quality_score,
+    )
+    usage.increment_perceive_usage(project_id)
+    return PerceiveResponse(
+        operation_id=operation_id,
+        status="completed",
+        url=url,
+        url_final=cached.url_final,
+        content_hash=cached.content_hash,
+        render_quality=cached.render_quality_score,
+        cache_hit=True,
+        outputs=outputs_from_keys(cached.output_keys, project_id),
+        structured=cached.structured_data,
+        extraction_tier=cached.extraction_tier,  # type: ignore[arg-type]
+        tokens=PerceiveTokens(),
+        cost_cents=0.0,
+        duration_ms=duration_ms,
+        warnings=[],
+    )
+
+
+def _process_outputs(
+    request: PerceiveRequest,
+    outputs: list[str],
+    extracts: list[str],
+    carried: _Captured,
+    warnings: list[str],
+) -> tuple[dict[str, bytes], Optional[dict[str, Any]]]:
+    """CPU-bound output materialization (runs in a worker thread)."""
+    html = carried.html or ""
+    final_url = carried.final_url or str(request.url)
+
+    scraping = None
+    needs_scrap = bool(extracts) or any(
+        name in outputs for name in ("markdown", "html_cleaned", "links", "images")
+    )
+    if needs_scrap:
+        scraping = scrap_html(final_url, html)
+
+    artifacts: dict[str, bytes] = {}
+    cleaned_html = (scraping.cleaned_html or "") if scraping else ""
+    fit_bytes: Optional[bytes] = None
+
+    if "markdown" in outputs:
+        artifacts["markdown"] = generate_markdown_bytes(
+            cleaned_html or html, final_url
+        )
+    if "markdown_fit" in outputs or "main_content" in extracts:
+        fit_bytes = generate_fit_markdown(html, final_url)
+    if "markdown_fit" in outputs and fit_bytes is not None:
+        artifacts["markdown_fit"] = fit_bytes
+    if "html_cleaned" in outputs:
+        artifacts["html_cleaned"] = (cleaned_html or html).encode("utf-8")
+    if "html_raw" in outputs:
+        artifacts["html_raw"] = html.encode("utf-8")
+    if "links" in outputs and scraping is not None:
+        artifacts["links"] = json.dumps(
+            serialize_links(scraping), ensure_ascii=False
+        ).encode("utf-8")
+    if "images" in outputs and scraping is not None:
+        artifacts["images"] = json.dumps(
+            serialize_images(scraping), ensure_ascii=False
+        ).encode("utf-8")
+    if "pdf" in outputs and carried.pdf_bytes is not None:
+        artifacts["pdf"] = carried.pdf_bytes
+    if "screenshot_full_page" in outputs and carried.screenshot_bytes is not None:
+        artifacts["screenshot_full_page"] = carried.screenshot_bytes
+    if "screenshot" in outputs and carried.screenshot_viewport_bytes is not None:
+        artifacts["screenshot"] = carried.screenshot_viewport_bytes
+
+    structured: Optional[dict[str, Any]] = None
+    if "structured" in outputs:
+        structured = {}
+        if "metadata" in extracts and scraping is not None:
+            structured["metadata"] = scraping.metadata or {}
+        if "structured_data" in extracts:
+            structured["structured_data"] = extract_json_ld(html)
+        if "headings" in extracts:
+            structured["headings"] = extract_headings(cleaned_html or html)
+        if "tables" in extracts and scraping is not None:
+            structured["tables"] = serialize_tables(scraping)
+        if "main_content" in extracts and fit_bytes is not None:
+            text = fit_bytes.decode("utf-8", errors="replace")
+            if len(text) > _MAIN_CONTENT_MAX_CHARS:
+                text = text[:_MAIN_CONTENT_MAX_CHARS]
+                warnings.append(
+                    "main_content truncated to "
+                    f"{_MAIN_CONTENT_MAX_CHARS} characters."
+                )
+            structured["main_content"] = text
+
+    return artifacts, structured
+
+
+async def _upload_artifacts(
+    artifacts: dict[str, bytes], operation_id: str, project_id: int
+) -> dict[str, dict[str, Any]]:
+    """Upload every artifact to storage; boto3 is sync, so each call runs
+    in a worker thread. Returns {output: {key, size_bytes, content_type}}."""
+    uploads: dict[str, dict[str, Any]] = {}
+    for name, payload in artifacts.items():
+        filename = _artifact_filename(operation_id, name)
+        result = await asyncio.to_thread(
+            upload_to_gcs, payload, str(project_id), V2_PERCEIVE_ENDPOINT, filename
+        )
+        uploads[name] = {
+            "key": result["object_key"],
+            "size_bytes": result["file_size"],
+            "content_type": _content_type_for(name),
+        }
+    return uploads

@@ -1,0 +1,21 @@
+F3-STATIC-PRICING-SENTINEL
+Home
+ About
+ Pricing
+Pricing page with a fixed table so the PDF render exercises table layout deterministically.
+Plan
+Conversions
+Max file size
+Free
+100
+5 MB
+Starter
+2000
+15 MB
+Pro
+10000
+50 MB
+Business
+50000
+150 MB
+F3 fixture footer - pricing page

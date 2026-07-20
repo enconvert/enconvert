@@ -1,0 +1,21 @@
+Sprint F.3 TDD RED/GREEN evidence — structural assertions in
+tests/v2/test_pdf_byte_identity.py vs pre-F.1 code (af4da28) and HEAD (ea5d4b2)
+Generated: 2026-06-06
+
+Assertion under test: the per-URL render converters dispatched by
+BROWSER_CONVERTER_MAP contain 'crawler_slot', '.arun(' and 'hook_session'
+(i.e. render goes through the Crawl4AI singleton with the F.1/F.2 hook pattern).
+
+pre-F.1 af4da28 url_pdf.py: {'crawler_slot': False, '.arun(': False, 'hook_session': False} -> RED (assertions FAIL)
+pre-F.1 af4da28 url_ss.py: {'crawler_slot': False, '.arun(': False, 'hook_session': False} -> RED (assertions FAIL)
+HEAD ea5d4b2 url_pdf.py: {'crawler_slot': True, '.arun(': True, 'hook_session': True} -> GREEN (assertions pass)
+HEAD ea5d4b2 url_ss.py: {'crawler_slot': True, '.arun(': True, 'hook_session': True} -> GREEN (assertions pass)
+
+Conclusion: the structural tests FAIL on the pre-F.1 render path and PASS at
+HEAD — the F.3 render swap was completed implicitly by F.1/F.2 because both
+website endpoints dispatch per-URL renders through BROWSER_CONVERTER_MAP.
+
+Comparator self-check (2026-06-06): tampered golden text_sha256 for
+static_index -> pytest FAILED with the drift message (exit 1); manifest
+restored -> full suite 9/9 PASS in 78s. Goldens captured from HEAD ea5d4b2,
+each fixture rendered twice, run-to-run text identical for all 4 slugs.

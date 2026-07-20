@@ -1,0 +1,54 @@
+Sprint F0.5 - verification item 4: hook mutation via closure-captured dict
+Date measured: 2026-06-06 13:12:20
+Environment: Darwin, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, playwright==1.57.0 (chromium installed)
+
+Method:
+  1. await BrowserManager.get_instance() -> get_crawler() -> crawler_strategy.
+  2. set_hook('after_goto', ...) and set_hook('before_return_html', ...).
+     Both hooks write into a closure-captured carrier dict and return page.
+  3. arun() with CrawlerRunConfig(cache_mode=BYPASS, page_timeout=30000).
+  4. After arun(), verify carrier contains both keys with value b'hello'.
+  Note: file:// URLs use set_content() internally; after_goto is still
+  called because execute_hook('after_goto') is outside the is_local_content
+  branch (async_crawler_strategy.py line 802 is at the same nesting level
+  as the if/else, i.e. always executed when not js_only).
+
+--- Attempt 1: file:// URL ---
+  URL: file:///var/folders/d3/j_txrrpd2pn5bhkrpxyhrdj80000gp/T/tmprn12ronp/probe04.html
+  arun() result.success: False
+  arun() result.url:     file:///var/folders/d3/j_txrrpd2pn5bhkrpxyhrdj80000gp/T/tmprn12ronp/probe04.html
+  arun() html len:       89
+  arun() error:          Blocked by anti-bot protection: Near-empty content (89 bytes) with HTTP 200
+  Carrier after arun():
+  after_goto stashed b'hello':         NO
+  after_goto url seen:                 <not set>
+  before_return_html stashed b'hello': NO
+  before_return_html html_len:         <not set>
+  firing order recorded:               []
+  Hooks fired on file://: NO
+
+--- Attempt 2 (fallback): https://example.com ---
+  URL: https://example.com
+  arun() result.success: True
+  arun() result.url:     https://example.com
+  arun() html len:       528
+  arun() error:          none
+  Carrier after arun():
+  after_goto stashed b'hello':         YES
+  after_goto url seen:                 https://example.com
+  before_return_html stashed b'hello': YES
+  before_return_html html_len:         528
+  firing order recorded:               ['after_goto', 'before_return_html']
+
+Plan expectation:
+  After arun() returns, carrier must contain:
+    carrier['after_goto']         == b'hello'
+    carrier['before_return_html'] == b'hello'
+  Both values populated by hooks before arun() returns.
+  Firing order recorded in carrier['order'].
+
+Both keys present with b'hello': YES
+Firing order: ['after_goto', 'before_return_html']
+
+Status: PASS

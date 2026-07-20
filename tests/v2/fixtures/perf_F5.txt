@@ -1,0 +1,27 @@
+Sprint F.5 live latency (sequential, dev box)
+{
+  "example": {
+    "v1_s": 10.5,
+    "v2_s": 12.3,
+    "pages": [
+      1,
+      1
+    ],
+    "similarity": 1.0
+  },
+  "python-org": {
+    "v1_s": 21.1,
+    "v2_s": 23.9,
+    "pages": [
+      1,
+      1
+    ],
+    "similarity": 1.0
+  },
+  "full_outputs": {
+    "v2_s": 25.1
+  },
+  "cache_hit": {
+    "v2_s": 0.1
+  }
+}

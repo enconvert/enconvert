@@ -1,0 +1,37 @@
+{
+  "example": {
+    "pages": 1,
+    "bytes": 42961,
+    "text_len": 128,
+    "text_sha256": "64ae952be9dbd30dc2139726b128d66fd0dfbf6c786a2992443633d00ebc8bd0",
+    "elapsed_s": 10.42
+  },
+  "wikipedia-pdf": {
+    "pages": 1,
+    "bytes": 1542465,
+    "text_len": 65559,
+    "text_sha256": "6d3eaaf92976c4c10ef5099876db8c552c7f88dfdfbfd6339a8ec67117892877",
+    "elapsed_s": 30.84
+  },
+  "github-crawl4ai": {
+    "pages": 2,
+    "bytes": 2075608,
+    "text_len": 14584,
+    "text_sha256": "29cddcea2913d1dccb7a25319605daff8acbafc83efcf715622ab313c9291a73",
+    "elapsed_s": 27.83
+  },
+  "stripe-pricing": {
+    "pages": 2,
+    "bytes": 3719907,
+    "text_len": 11666,
+    "text_sha256": "3cd444071a095cd416bbff4ebbacbecc7d285ba5ec845c8b77e0363bf3608cc1",
+    "elapsed_s": 25.69
+  },
+  "python-org": {
+    "pages": 1,
+    "bytes": 791896,
+    "text_len": 3956,
+    "text_sha256": "b8890489ec6d7e230a041b4518c84921024d15d8c85cc439e2e382687421d597",
+    "elapsed_s": 11.69
+  }
+}

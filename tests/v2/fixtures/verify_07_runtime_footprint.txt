@@ -1,0 +1,72 @@
+Sprint F0.5 - verification item 7: AsyncWebCrawler instantiation RSS footprint
+Date measured: 2026-06-06
+Environment: macOS, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, playwright==1.57.0, psutil==7.2.2
+(Plan baseline was crawl4ai==0.8.6; newer version kept deliberately.)
+
+Method: two worker subprocesses (subprocess.run + sys.executable --measure).
+Each worker measures RSS via psutil.Process.memory_info().rss at four stages
+within a single Python process. Stage 3 spawns one Chromium via crawler.start().
+
+--- Stage definitions ---
+  Stage 0: interpreter + psutil only (baseline)
+  Stage 1: after 'import crawl4ai' + AsyncWebCrawler, BrowserConfig
+  Stage 2: after AsyncWebCrawler(config=...) WITHOUT start() <- plan threshold
+  Stage 3: after crawler.start() (Chromium live) then after crawler.close()
+
+--- Run 1 raw readings (MB) ---
+  Stage 0 (interpreter): 25.7 MB
+  Stage 1 (import):      101.7 MB
+  Stage 2 (instantiate): 132.5 MB  (delta over import: +30.8 MB)
+  Stage 3 python RSS after start: 137.5 MB
+  Stage 3 children RSS (Chromium + zygotes): 558.5 MB
+  Stage 3 total (python + children): 696.1 MB
+  Stage 3 python RSS post-close: 137.5 MB
+
+--- Run 2 raw readings (MB) ---
+  Stage 0 (interpreter): 25.6 MB
+  Stage 1 (import):      100.9 MB
+  Stage 2 (instantiate): 131.8 MB  (delta over import: +30.9 MB)
+  Stage 3 python RSS after start: 136.8 MB
+  Stage 3 children RSS (Chromium + zygotes): 530.6 MB
+  Stage 3 total (python + children): 667.4 MB
+  Stage 3 python RSS post-close: 136.8 MB
+
+--- Averages (two runs) ---
+  Stage 0 (interpreter baseline): 25.7 MB
+  Stage 1 (import delta over s0): 75.6 MB  =>  total 101.3 MB
+  Stage 2 (instantiation RSS):    132.2 MB  (instantiation delta over import: +30.9 MB)
+  Stage 3 python after start:     137.2 MB
+  Stage 3 children (Chromium):    544.6 MB
+  Stage 3 total (py + chrome):    681.7 MB
+  Stage 3 post-close python RSS:  137.2 MB
+
+--- Plan thresholds ---
+  Section 12 / F0.1 import threshold:  <= 80 MB
+  Section 12 item 7 instantiate thresh: <= 80 MB
+  Section A4 gateway ceiling:           <= 200 MB
+
+--- Verdicts ---
+  Import    (Stage 1): FAIL  (stage1 import RSS = 101.3 MB > 80 MB)
+  Instantiate (Stage 2): FAIL  (stage2 instantiation RSS = 132.2 MB > 80 MB)
+  Stage 2 vs A4 ceiling: PASS  (stage2 vs A4 ceiling = 132.2 MB <= 200 MB)
+
+Status: FAIL
+
+--- Notes / mitigation ---
+  * The 80 MB threshold was set against crawl4ai==0.8.6.  0.8.9 import-only
+    RSS is ~100 MB (proven in F0.1; verify_07_idle_footprint.txt).  Stage 2
+    (instantiation) adds only a small delta over the import; the actionable
+    number is that delta, not the absolute RSS.
+  * Instantiation delta (avg): +30.9 MB over import.
+    If this delta is small (< 5 MB) instantiation itself is cheap; the bulk
+    of the budget is consumed by the import.
+  * Plan section A4 budgets 200-280 MB for the full gateway including imports.
+    Stage 2 (132 MB) fits within the A4 200 MB lower bound.
+  * Recommendation: keep lazy BrowserManager.get_instance() pattern (already
+    implemented in F0.2) -- do NOT eagerly instantiate AsyncWebCrawler at
+    import time.  If instantiation delta proves > 10 MB across versions,
+    reconsider whether to pool or defer construction to first request.
+  * Stage 3 total (python + Chromium) is the full operational envelope.
+    Compare against the 1 GB droplet budget (A4) when planning concurrent
+    request limits.

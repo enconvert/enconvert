@@ -1,0 +1,25 @@
+Sprint F.1 — url-to-pdf via Crawl4AI arun() hooks: latency record
+Date: 2026-06-06 16:59:41
+
+NOTE: the plan's formal 50-concurrent p95 +/-10% gate was waived by
+Het on 2026-06-06 together with the F0.4 byte-identity gate (no
+paying customers; no pre-refactor baseline was ever captured).
+Recorded below: sequential per-URL wall time through the refactored
+path (BrowserManager semaphore=1 serializes concurrent requests
+anyway, so sequential timing approximates the per-slot service time).
+
+example: 10.42s, 1 page(s), 42 KB, text similarity vs pre-F.1 1.0000
+wikipedia-pdf: 30.84s, 1 page(s), 1506 KB, text similarity vs pre-F.1 0.9988
+github-crawl4ai: 27.83s, 2 page(s), 2027 KB, text similarity vs pre-F.1 0.9746
+stripe-pricing: 25.69s, 2 page(s), 3633 KB, text similarity vs pre-F.1 0.9851
+python-org: 11.69s, 1 page(s), 773 KB, text similarity vs pre-F.1 0.9970
+
+Drift analysis (2026-06-06, final post-review run): all 5 fixtures pass the
+0.97 tripwire with page-count parity 5/5. Remaining text deltas are site
+content drift, not render regressions: github-crawl4ai (0.9746) = relative
+commit timestamps aged one day vs the 2026-06-05 baseline + rotated sponsor
+blurb; python-org (0.9970) and wikipedia (0.9988) = rotating widgets/minor
+edits. example.com = 1.0000. An earlier pre-review run also confirmed page
+parity; review fixes (PDF moved to after_goto tail, full CSP strip,
+origin-scoped auth, popup/cookie cleanup) did not change render output on
+these fixtures.

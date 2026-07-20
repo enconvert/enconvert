@@ -1,0 +1,187 @@
+ Search
+ 
+GO
+Get Started
+Whether you're new to
+programming or an experienced
+developer, it's easy to learn and use
+Python.
+Start with our Beginner’s Guide
+Download
+Python source code and installers
+are available for download for all
+versions!
+Latest: Python 3.14.5
+Docs
+Documentation for Python's
+standard library, along with tutorials
+and guides, are available online.
+docs.python.org
+Jobs
+Looking for work or have a Python
+related position that you're trying to
+hire for? Our relaunched
+community-run job board is the
+place to go.
+jobs.python.org
+ 
+ 
+ 
+ 
+ 
+ 
+Python is a programming language that lets you work quickly
+and integrate systems more effectively. >>> Learn More
+Help & General Contact
+ Diversity Initiatives
+ Submit Website Bug
+ Status 
+Copyright ©2001-2026.  Python Software Foundation  Legal Statements  Privacy Notice
+Python
+PSF
+Docs
+PyPI
+Jobs
+Community
+Donate
+Donate
+Socialize
+About
+Downloads
+Documentation
+Community
+Success Stories
+News
+Events
+Compound Data Types
+Lists (known as arrays in other languages) are one of the
+compound data types that Python understands. Lists can be
+indexed, sliced and manipulated with other built-in
+functions. More about lists in Python 3
+# Python 3: List comprehensions
+>>> fruits = ['Banana', 'Apple', 'Lime']
+>>> loud_fruits = [fruit.upper() for fruit in 
+fruits]
+>>> print(loud_fruits)
+['BANANA', 'APPLE', 'LIME']
+# List and the enumerate function
+>>> list(enumerate(fruits))
+[(0, 'Banana'), (1, 'Apple'), (2, 'Lime')]
+2
+1
+3
+4
+5
+Latest News
+>>> More
+PSF Strategic Plan 2026 Draft: Open for Community Feedback
+2026-06-04
+No Starch Press Humble Bundle: Grab a Deal and Support the PSF!
+2026-06-02
+Python 3.15.0 beta 2 is here!
+2026-06-02
+PSF Welcomes Hudson River Trading (HRT) as a Visionary Sponsor
+2026-05-13
+Announcing PSF Community Service Award Recipients!
+2026-05-12
+Upcoming Events
+>>> More
+GeoPython 2026
+2026-06-08
+Python for (Almost) Everything
+2026-06-18
+PyCon Singapore 2026
+2026-06-19
+Python Norte 2026
+2026-07-03
+EuroPython 2026
+2026-07-13
+Success Stories
+Python provides convenience and flexibility for scalable ML/AI by Dean Wampler
+>>> More
+Python's convenience has made it the most popular
+language for machine learning and artificial intelligence.
+Python's flexibility has allowed Anyscale to make ML/AI
+scalable from laptops to clusters.
+Use Python for…
+Web Development: Django , Pyramid , Bottle , Tornado , Flask , Litestar , FastAPI
+GUI Development: tkInter , PyGObject , PyQt , PySide , Kivy , wxPython , DearPyGui
+AI and Machine Learning: PyTorch , TensorFlow , scikit-learn , Transformers ,
+Anthropic , LangChain
+Scientific and Numeric: SciPy , Pandas , IPython
+Software Development: Buildbot , Trac , Roundup
+System Administration: Ansible , Salt , OpenStack , xonsh
+>>> More
+>>>  Python Software Foundation
+The mission of the Python Software Foundation is to promote, protect, and advance the Python programming
+language, and to support and facilitate the growth of a diverse and international community of Python
+programmers. >>> Learn more
+Become a Member
+Become a Member
+ 
+Donate to the PSF
+Donate to the PSF
+About
+Applications
+Quotes
+Getting Started
+Help
+Python Brochure
+Downloads
+All releases
+Source code
+Windows
+macOS
+Android
+Other Platforms
+License
+Alternative Implementations
+Documentation
+Docs
+Audio/Visual Talks
+Beginner's Guide
+FAQ
+Non-English Docs
+PEP Index
+Python Books
+Python Essays
+Community
+Diversity
+Mailing Lists
+IRC
+Forums
+PSF Annual Impact Report
+Python Conferences
+Special Interest Groups
+Python Logo
+Python Wiki
+Code of Conduct
+Community Awards
+Get Involved
+Shared Stories
+Success Stories
+Arts
+Business
+Education
+Engineering
+Government
+Scientific
+Software Development
+News
+Python News
+PSF Newsletter
+PSF News
+PyCon US News
+News from the Community
+Events
+Python Events
+User Group Events
+Python Events Archive
+User Group Events Archive
+Submit an Event
+Contributing
+Developer's Guide
+Issue Tracker
+python-dev list
+Core Mentorship
+Report a Security Issue

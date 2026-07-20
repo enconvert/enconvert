@@ -1,0 +1,21 @@
+Sprint F0.1 - verification item 7: idle Crawl4AI import RSS
+Date measured: 2026-06-05
+Environment: macOS, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, anthropic==0.105.2
+(Plan baseline in V2-VISION-AND-IMPLEMENTATION-PLAN-v3.md SS0.1 was crawl4ai==0.8.6 /
+anthropic==0.104.1; newer versions kept deliberately - already installed and verified.)
+
+Command:
+  .venv/bin/python -c "import crawl4ai; import psutil, os; print(psutil.Process(os.getpid()).memory_info().rss // 1024 // 1024, 'MB')"
+
+Result: 100 MB (two runs: 100 MB, 101 MB)
+Interpreter baseline (import psutil only): 16 MB
+Crawl4AI import delta: ~84 MB
+
+Plan threshold (Task F0.1 verification b): <= 80 MB
+Status: EXCEEDS threshold by ~20 MB at crawl4ai==0.8.9. Threshold was set against
+0.8.6. Revisit the SSA4 1 GB droplet memory budget in F0.2/F0.5 before relying on the
+80 MB assumption.
+
+Note: import emits a pre-existing RequestsDependencyWarning (urllib3 2.6.3 /
+chardet 7.4.3 vs unpinned requests) - unrelated to crawl4ai, left as is.

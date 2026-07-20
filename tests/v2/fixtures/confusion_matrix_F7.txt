@@ -1,0 +1,59 @@
+Sprint F.7 verification (a): 50-record corpus confusion matrix
+Detection rule: is_blocked or is_login_wall or score < 0.6
+
+  DET [B] score=0.4   good    good_article_cf_explainer
+      [-] score=1.0   good    good_article_db_indexing
+      [-] score=1.0   good    good_article_docker_tutorial
+      [-] score=1.0   good    good_article_news_tech
+      [-] score=1.0   good    good_article_opinion
+      [-] score=1.0   good    good_commerce_comparison
+      [-] score=1.0   good    good_commerce_feature_tour
+      [-] score=1.0   good    good_commerce_pricing
+      [-] score=1.0   good    good_commerce_product_jsonld
+      [-] score=1.0   good    good_commerce_saas_landing
+      [-] score=1.0   good    good_community_contact_recaptcha
+      [-] score=1.0   good    good_community_event
+      [-] score=1.0   good    good_community_forum_thread
+      [-] score=1.0   good    good_community_qa
+      [-] score=1.0   good    good_community_wiki
+      [-] score=1.0   good    good_docs_changelog
+      [-] score=1.0   good    good_docs_fastapi_style
+      [-] score=1.0   good    good_docs_mdn_reference
+      [-] score=1.0   good    good_docs_oss_readme
+      [-] score=1.0   good    good_docs_rest_api
+      [-] score=1.0   good    good_edge_dashboard_public
+      [-] score=1.0   good    good_edge_gallery
+      [-] score=1.0   good    good_edge_status_page
+      [-] score=1.0   good    good_python_org_home
+      [-] score=1.0   good    good_stripe_pricing
+  DET [-] score=0.5   blocked blocked_akamai_reference
+      [-] score=0.85  blocked blocked_cf_1020
+  DET [B] score=0.15  blocked blocked_cf_ddos_interstitial
+  DET [B] score=0.15  blocked blocked_cf_js_challenge_noscript
+  DET [B] score=0.25  blocked blocked_cf_legacy_browser_check
+  DET [B] score=0.15  blocked blocked_cf_turnstile
+  DET [B] score=0.15  blocked blocked_cloudflare_anchor
+      [-] score=0.9   blocked blocked_consent_cross_domain
+  DET [B] score=0.35  blocked blocked_datadome_captcha
+  DET [-] score=0.5   blocked blocked_degenerate_json_body
+  DET [-] score=0.5   blocked blocked_degenerate_nginx_403
+  DET [-] score=0.4   blocked blocked_degenerate_skeleton
+  DET [-] score=0.25  blocked blocked_degenerate_spa_shell
+  DET [B] score=0.35  blocked blocked_generic_waf
+  DET [-] score=0.5   blocked blocked_geo_451
+  DET [B] score=0.5   blocked blocked_google_sorry
+  DET [B] score=0.35  blocked blocked_hcaptcha_anchor
+  DET [L] score=0.6   blocked blocked_login_community_gate
+  DET [L] score=0.6   blocked blocked_login_news_paywall
+  DET [L] score=0.45  blocked blocked_login_saas_app
+  DET [L] score=0.45  blocked blocked_login_sso
+  DET [L] score=0.45  blocked blocked_login_wall_anchor
+  DET [L] score=0.45  blocked blocked_paywall_account_redirect
+  DET [B] score=0.35  blocked blocked_perimeterx_press_hold
+  DET [B] score=0.35  blocked blocked_rate_limit_429
+
+TP=23 FN=2 FP=1 TN=24
+True-positive rate:  23/25 = 92%  (gate: >= 90%)
+False-positive rate: 1/25 = 4%  (gate: < 10%)
+Known misses (honest hard cases): [('blocked_cf_1020', 0.85), ('blocked_consent_cross_domain', 0.9)]
+Known false alarms (honest hard cases): [('good_article_cf_explainer', 0.4)]

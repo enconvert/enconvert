@@ -1,0 +1,455 @@
+unclecode / crawl4ai
+Public
+171 Branches
+53 Tags
+Go to file
+Code
+unclecode security: patch proxy SSRF in Docker server (0.8.9)
+cdf2ead · yesterday
+1,533 Commits
+.claude
+test: add comprehensive regression test suite (291 tests)
+3 months ago
+.context
+feat: HTTP strategy detects and saves file downloads (CS…
+3 months ago
+.github
+fix: batch merge of community PRs (#1622, #1786, #1796, …
+3 months ago
+crawl4ai
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+deploy/docker
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+docs
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+prompts
+feat(crawler): add network request and console message …
+last year
+sbom
+Add CycloneDX SBOM and generation script
+5 months ago
+scripts
+Add stats dashboard page for LP summit
+4 months ago
+tests
+feat: Add DomainMapper for comprehensive domain URL …
+4 days ago
+.env.txt
+chore: Update environment variable usage in config f…
+2 years ago
+.gitattributes
+Update .gitattributes
+last year
+.gitignore
+chore: gitignore out/ local pipeline output
+3 days ago
+CHANGELOG.md
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+CODE_OF_CONDUCT.md
+Docs: Add Code of Conduct for the project (#410)
+2 years ago
+CONTRIBUTING.md
+Add contributing guide and update mkdocs navigation for …
+4 months ago
+CONTRIBUTORS.md
+fix: MCP SSE endpoint crash — mount via raw ASGI Route …
+3 months ago
+Dockerfile
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+JOURNAL.md
+Merge branch 'next-stress' into next
+last year
+LICENSE
+feat(core): release version 0.5.0 with deep crawling and CLI
+last year
+MANIFEST.in
+Fix js_snipprt issue 0.4.21
+2 years ago
+MISSION.md
+Refactor mission section in README and add mission diag…
+2 years ago
+PROGRESSIVE_CRAWLING.md
+feat(crawl4ai): Implement adaptive crawling feature
+last year
+README-first.md
+Add Founding Sponsors section and update README with …
+10 months ago
+README.md
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+ROADMAP.md
+Update Roadmap
+2 years ago
+SECURITY-CREDITS.md
+security: patch proxy SSRF in Docker server (0.8.9)
+yesterday
+SECURITY.md
+Merge pull request #1771 from hafezparast/claude/check-f…
+4 months ago
+SPONSORS.md
+feat: add scheduling link to contact information in SPONS…
+10 months ago
+cliff.toml
+feat(core): release version 0.5.0 with deep crawling and CLI
+last year
+docker-compose.yml
+fix(docker): Remove environment variable overrides in doc…
+8 months ago
+mkdocs.yml
+feat: Add DomainMapper for comprehensive domain URL …
+4 days ago
+pyproject.toml
+fix: replace litellm with unclecode-litellm due to PyPI suppl…
+3 months ago
+requirements.txt
+fix: replace litellm with unclecode-litellm due to PyPI suppl…
+3 months ago
+setup.cfg
+Update README, add manifest, make selenium optional lib…
+2 years ago
+setup.py
+Release/v0.7.6 (#1556)
+8 months ago
+test_llm_webhook_feature.py
+Release/v0.7.6 (#1556)
+8 months ago
+test_webhook_implementation.py
+Release/v0.7.6 (#1556)
+8 months ago
+uv.lock
+Release v0.8.0: Crash Recovery, Prefetch Mode & Security…
+5 months ago
+GITHUB TRENDING
+#1 Repository Of The Day
+1
+Stars
+Stars
+68k
+68k
+Forks
+Forks
+6.9k
+6.9k
+python
+python 3.10 | 3.11 | 3.12 | 3.13
+3.10 | 3.11 | 3.12 | 3.13
+downloads/month
+downloads/month 2M
+2M
+Sponsors
+Sponsors 14
+14
+Reliable, large-scale web extraction, now built to be drastically more cost-effective than any of the existing
+solutions.
+👉 Apply here for early access
+We’ll be onboarding in phases and working closely with early users. Limited slots.
+FOLLOW ON X
+FOLLOW ON LINKEDIN
+JOIN OUR DISCORD
+Crawl4AI turns the web into clean, LLM ready Markdown for RAG, agents, and data pipelines. Fast, controllable,
+battle tested by a 50k+ star community.
+✨ Check out latest update v0.8.9
+✨ New in v0.8.9: Follow-up security patch for the self-hosted Docker API server, closing an SSRF via proxy
+settings that 0.8.8 did not cover. Backward compatible. If you run the Docker server, upgrade. A larger secure-by-
+default release with breaking changes is coming in ~1-2 weeks. Release notes →
+✨ Recent v0.8.6: Security hotfix that replaced litellm  with unclecode-litellm  due to a PyPI supply chain
+compromise.
+✨ Previous v0.8.0: Crash Recovery & Prefetch Mode! Deep crawl crash recovery with resume_state  and
+on_state_change  callbacks for long-running crawls. New prefetch=True  mode for 5-10x faster URL discovery.
+Release notes →
+✨ Previous v0.7.8: Stability & Bug Fix Release! 11 bug fixes addressing Docker API issues, LLM extraction
+improvements, URL handling fixes, and dependency updates. Release notes →
+🤓 My Personal Story
+Why developers pick Crawl4AI
+1. Install Crawl4AI:
+If you encounter any browser-related issues, you can install them manually:
+2. Run a simple web crawl with Python:
+3. Or use the new command-line interface:
+🎉 Sponsorship Program Now Open! After powering 51K+ developers and 1 year of growth, Crawl4AI is
+launching dedicated support for startups and enterprises. Be among the first 50 Founding Sponsors for
+permanent recognition in our Hall of Fame.
+Crawl4AI is the #1 trending open-source web crawler on GitHub. Your support keeps it independent, innovative, and
+free for the community — while giving you direct access to premium benefits.
+BECOME A SPONSOR
+CURRENT SPONSORS
+1 4
+🌱 Believer ($5/mo) — Join the movement for data democratization
+🚀 Builder ($50/mo) — Priority support & early access to features
+💼 Growing Team ($500/mo) — Bi-weekly syncs & optimization help
+🏢 Data Infrastructure Partner ($2000/mo) — Full partnership with dedicated support
+Custom arrangements available - see SPONSORS.md for details & contact
+Why sponsor?
+No rate-limited APIs. No lock-in. Build and own your data pipeline with direct guidance from the creator of Crawl4AI.
+See All Tiers & Benefits →
+📝 Markdown Generation
+📊 Structured Data Extraction
+🌐 Browser Integration
+🔎 Crawling & Scraping
+🚀 Deployment
+🎯 Additional Features
+✨ Play around with this 
+Open in Colab
+Open in Colab
+✨ Visit our Documentation Website
+Crawl4AI offers flexible installation options to suit various use cases. You can install it as a Python package or use
+Docker.
+🐍 Using pip
+🐳 Docker Deployment
+You can check the project structure in the directory docs/examples. Over there, you can find a variety of examples;
+here, some popular examples are shared.
+📝 Heuristic Markdown Generation with Clean and Fit Markdown
+🖥️ Executing JavaScript & Extract Structured Data without LLMs
+📚 Extracting Structured Data with LLMs
+🤖 Using Your own Browser with Custom User Profile
+💡 Tip: Some websites may use CAPTCHA based verification mechanisms to prevent automated access. If
+your workflow encounters such challenges, you may optionally integrate a third-party CAPTCHA-handling
+service such as CapSolver. They support reCAPTCHA v2/v3, Cloudflare Turnstile, Challenge, AWS WAF, and
+more. Please ensure that your usage complies with the target website’s terms of service and applicable laws.
+Version 0.8.9 Release Highlights - Proxy SSRF Patch
+A follow-up, backward-compatible security patch for the self-hosted Docker API server: closes an SSRF via proxy
+settings ( proxy_config.server , the deprecated proxy , crawler_config.proxy_config , and proxy/DNS flags in
+extra_args ) that 0.8.8 did not cover. Proxy destinations are now validated like crawl URLs. Upgrade in place, no
+config changes. A larger secure-by-default release with breaking changes is coming in ~1-2 weeks; a migration
+guide will accompany the pre-announcement.
+Full v0.8.9 Release Notes →
+Version 0.8.8 Release Highlights - Docker Server Security Patch
+Version 0.8.7 Release Highlights - Security Hardening, DomainMapper & Community Fixes
+Version 0.8.6 - Security Hotfix: litellm Supply Chain Fix
+Version 0.8.5 Release Highlights - Anti-Bot Detection, Shadow DOM & 60+ Bug Fixes
+Version 0.8.0 Release Highlights - Crash Recovery & Prefetch Mode
+Version 0.7.8 Release Highlights - Stability & Bug Fix Release
+Version 0.7.7 Release Highlights - The Self-Hosting & Monitoring Update
+Version 0.7.5 Release Highlights - The Docker Hooks & Security Update
+Version 0.7.4 Release Highlights - The Intelligent Table Extraction & Performance Update
+Version 0.7.3 Release Highlights - The Multi-Config Intelligence Update
+Version 0.7.0 Release Highlights - The Adaptive Intelligence Update
+Crawl4AI follows standard Python version numbering conventions (PEP 440) to help users understand the stability
+and features of each release.
+📈 Version Numbers Explained
+🚨 Documentation Update Alert: We're undertaking a major documentation overhaul next week to reflect
+recent updates and improvements. Stay tuned for a more comprehensive and up-to-date guide!
+For current documentation, including installation instructions, advanced features, and API reference, visit our
+Documentation Website.
+To check our development plans and upcoming features, visit our Roadmap.
+📈 Development TODOs
+We welcome contributions from the open-source community. Check out our contribution guidelines for more
+information.
+I'll help modify the license section with badges. For the halftone effect, here's a version with it:
+Here's the updated license section:
+This project is licensed under the Apache License 2.0, attribution is recommended via the badges below. See the
+Apache 2.0 License file for details.
+When using Crawl4AI, you must include one of the following attribution methods:
+📈 1. Badge Attribution (Recommended)
+📖 2. Text Attribution
+If you use Crawl4AI in your research or project, please cite:
+Text citation format:
+For questions, suggestions, or feedback, feel free to reach out:
+GitHub: unclecode
+Twitter: @unclecode
+Website: crawl4ai.com
+Happy Crawling! 🕸️🚀
+Our mission is to unlock the value of personal and enterprise data by transforming digital footprints into structured,
+tradeable assets. Crawl4AI empowers individuals and organizations with open-source tools to extract and structure
+data, fostering a shared data economy.
+We envision a future where AI is powered by real human knowledge, ensuring data creators directly benefit from
+their contributions. By democratizing data and enabling ethical sharing, we are laying the foundation for authentic
+AI advancement.
+🔑 Key Opportunities
+🚀 Development Pathway
+Our enterprise sponsors and technology partners help scale Crawl4AI to power production-grade data pipelines.
+Company
+About
+Sponsorship
+Tier
+Leveraging Thordata ensures seamless compatibility with any AI/ML
+workflows and data infrastructure, massively accessing web data with
+99.9% uptime, backed by one-on-one customer support.
+🥈 Silver
+nstproxy
+NstProxy is a trusted proxy provider with over 110M+ real residential
+IPs, city-level targeting, 99.99% uptime, and low pricing at $0.1/GB, it
+delivers unmatched stability, scale, and cost-efficiency.
+🥈 Silver
+Scrapeless provides production-grade infrastructure for Crawling,
+Automation, and AI Agents, offering Scraping Browser, 4 Proxy Types
+and Universal Scraping API.
+🥈 Silver
+Capsolver
+AI-powered Captcha solving service. Supports all major Captcha types,
+including reCAPTCHA, Cloudflare, and more
+🥉 Bronze
+Helps engineers and buyers find, compare, and source electronic &
+industrial parts in seconds, with specs, pricing, lead times &
+alternatives.
+🥇 Gold
+KidoCode
+Kidocode is a hybrid technology and entrepreneurship school for kids
+aged 5–18, offering both online and on-campus education.
+🥇 Gold
+Singapore-based Aleph Null is Asia’s leading edtech hub, dedicated to
+student-centric, AI-driven education—empowering learners with the
+tools to thrive in a fast-changing world.
+🥇 Gold
+A heartfelt thanks to our individual supporters! Every contribution helps us keep our opensource mission alive and
+thriving!
+Want to join them? Sponsor Crawl4AI →
+star-history.com
+July
+October
+2025
+April
+July
+October
+2026
+April
+10K
+20K
+30K
+40K
+50K
+60K
+unclecode/crawl4ai
+Star History
+Date
+GitHub Stars
+About
+🚀🤖 Crawl4AI: Open-source LLM
+Friendly Web Crawler & Scraper.
+Don't be shy, join here:
+https://discord.gg/jP8KfhDhyN
+crawl4ai.com
+ Readme
+ Apache-2.0 license
+ Code of conduct
+ Contributing
+ Security policy
+Activity
+67.8k stars
+373 watching
+6.9k forks
+Report repository
+Releases 17
+Release v0.8.9
+Latest
+yesterday
++ 16 releases
+Sponsor this project
+unclecode UncleCode
+Learn more about GitHub Sponsors
+Packages
+No packages published
+Used by 3.1k
++ 3,067
+Contributors
+81
++ 67 contributors
+Languages
+Python 98.8%
+Other 1.2%
+Sponsor
+Notifications
+Fork 6.9k
+ Star 67.8k
+Code
+Issues
+19
+Pull requests
+69
+Discussions
+Actions
+Projects
+Security and quality
+8
+Insights
+main
+🚀🤖 Crawl4AI: Open-source LLM Friendly Web Crawler &
+Scraper.
+🚀 Crawl4AI Cloud API — Closed Beta (Launching Soon)
+🚀 Quick Start
+# Install the package
+pip install -U crawl4ai
+# For pre release versions
+pip install crawl4ai --pre
+# Run post-installation setup
+crawl4ai-setup
+# Verify your installation
+crawl4ai-doctor
+python -m playwright install --with-deps chromium
+import asyncio
+from crawl4ai import *
+async def main():
+    async with AsyncWebCrawler() as crawler:
+        result = await crawler.arun(
+            url="https://www.nbcnews.com/business",
+        )
+        print(result.markdown)
+if __name__ == "__main__":
+    asyncio.run(main())
+# Basic crawl with markdown output
+crwl https://www.nbcnews.com/business -o markdown
+# Deep crawl with BFS strategy, max 10 pages
+crwl https://docs.crawl4ai.com --deep-crawl bfs --max-pages 10
+# Use LLM extraction with a specific question
+crwl https://www.example.com/products -q "Extract all product prices"
+💖 Support Crawl4AI
+🤝 Sponsorship Tiers
+✨ Features
+Try it Now!
+Installation 🛠️
+🔬 Advanced Usage Examples 🔬
+✨ Recent Updates
+pip install -U crawl4ai
+Version Numbering in Crawl4AI
+📖 Documentation & Roadmap
+🤝 Contributing
+📄 License & Attribution
+Attribution Requirements
+📚 Citation
+@software{crawl4ai2024,
+  author = {UncleCode},
+  title = {Crawl4AI: Open-source LLM Friendly Web Crawler & Scraper},
+  year = {2024},
+  publisher = {GitHub},
+  journal = {GitHub Repository},
+  howpublished = {\url{https://github.com/unclecode/crawl4ai}},
+  commit = {Please use the commit hash you're working with}
+}
+UncleCode. (2024). Crawl4AI: Open-source LLM Friendly Web Crawler & Scraper [Computer software]
+GitHub. https://github.com/unclecode/crawl4ai
+📧 Contact
+🗾 Mission
+🌟 Current Sponsors
+🏢 Enterprise Sponsors & Partners
+🧑‍
+🤝 Individual Sponsors
+Star History
+Sponsor
+README
+Code of conduct
+Contributing
+Apache-2.0 license
+Security
+Pricing
+Search or jump to...
+Sign up
+Platform
+Solutions
+Resources
+Open Source
+Enterprise
+Sign in
+© 2026 GitHub, Inc.
+Terms
+Privacy
+Security
+Status
+Community
+Docs
+Contact
+Manage cookies
+Do not share my personal information

@@ -1,0 +1,92 @@
+Sprint F0.5 - verification item 9: stealth baseline comparison
+Date measured: 2026-06-06 12:57:01
+Environment: macOS, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, playwright==1.57.0, playwright-stealth==2.0.0, anthropic==0.105.2, psutil==7.2.2, PyMuPDF==1.25.5
+
+Method:
+  Arm A (V2): AsyncWebCrawler(BrowserConfig(enable_stealth=True, ...))
+    arun(url, CrawlerRunConfig(cache_mode=BYPASS, page_timeout=90000ms,
+    delay_before_return_html=20.0s, magic=False, simulate_user=False))
+    magic/simulate_user intentionally OFF to isolate enable_stealth alone.
+    Metrics attached via on_page_context_created hook (closure carrier).
+
+  Arm B (V1 baseline, pre-F0.2 pattern):
+    Stealth().use_async(async_playwright()).__aenter__()
+    chromium.launch(headless=True, args=CHROMIUM_MEMORY_FLAGS)
+    new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', bypass_csp=True)
+    page.goto(url, wait_until='domcontentloaded', timeout=90000ms)
+    Poll up to 25s for challenge to clear (title + body stability).
+
+  Arms run SEQUENTIALLY (never concurrent against Cloudflare).
+  One retry per arm per URL on hard timeout.
+
+  Challenge markers checked: 'Just a moment', 'cf-chl', 'challenge-platform'
+
+  Note: crawl4ai enable_stealth internally uses the SAME playwright_stealth
+  2.0.0 Stealth() via StealthAdapter (browser_adapter.py ~line 151), applying
+  it per-page inside arun(). V1 wrapped the entire playwright instance.
+  This probe validates per-page application is equivalent.
+
+Results:
+======================================================================
+
+URL [PRIMARY]: https://www.scrapingcourse.com/cloudflare-challenge
+
+  Arm          : A (V2/crawl4ai)
+  HTTP status  : 200 (crawl4ai=307)
+  Body length  : 31835 bytes
+  JS errors    : 0
+  Console errs : 4
+  Title        : 'Just a moment...'
+  CF markers   : Just a moment, cf-chl, challenge-platform
+  Challenge clear: NO
+  Elapsed      : 21.2s
+
+
+  Arm          : B (V1/playwright_stealth)
+  HTTP status  : 200
+  Body length  : 31835 bytes
+  JS errors    : 0
+  Console errs : 4
+  Title        : 'Just a moment...'
+  CF markers   : Just a moment, cf-chl, challenge-platform
+  Challenge clear: NO
+  Elapsed      : 25.9s
+
+
+URL [SECONDARY]: https://nowsecure.nl/
+
+  Arm          : A (V2/crawl4ai)
+  HTTP status  : 200 (crawl4ai=200)
+  Body length  : 179917 bytes
+  JS errors    : 1
+  Console errs : 1
+  Title        : 'nowsecure.nl'
+  CF markers   : cf-chl, challenge-platform
+  Challenge clear: NO
+  Elapsed      : 23.6s
+
+
+  Arm          : B (V1/playwright_stealth)
+  HTTP status  : 200
+  Body length  : 179917 bytes
+  JS errors    : 1
+  Console errs : 0
+  Title        : 'nowsecure.nl'
+  CF markers   : cf-chl, challenge-platform
+  Challenge clear: NO
+  Elapsed      : 27.3s
+
+======================================================================
+
+Plan expectation / threshold:
+  PASS if for each URL, Arm A clears the challenge whenever Arm B does
+  (HTTP 200, no CF markers), and body lengths are within the same order
+  of magnitude (ratio <= 10x).
+  FAIL if Arm B clears and Arm A does not -> mitigation: keep
+  playwright_stealth additively (plan section A2 keep-decision stands).
+  PARTIAL if neither arm clears the primary fixture -- fall back to
+  secondary URL comparison for verdict.
+
+Status: PARTIAL
+  Primary fixture too strong to discriminate (neither arm cleared). Secondary URL: Arm A cleared or neither arm cleared -- cannot confirm regression. Operator should re-run against a lighter anti-bot page or with longer settle times.

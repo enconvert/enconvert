@@ -1,0 +1,8 @@
+Sprint H.1 /v2/discover live verification
+baseline_chromium=0 final_chromium=0
+
+static-crawl   mode=crawl   total=  80 pages_crawled= 49 truncated=True chromium_delta=0   8.73s
+static-hybrid  mode=hybrid  total=  80 pages_crawled= 49 truncated=True chromium_delta=0  22.50s
+spa-crawl      mode=crawl   total=   1 pages_crawled=  1 truncated=False chromium_delta=0   0.15s
+sitemap        mode=sitemap total= 200 pages_crawled=  0 truncated=True chromium_delta=0   0.99s
+robots-on      mode=crawl   total=  40 pages_crawled= 39 truncated=True chromium_delta=0   7.64s

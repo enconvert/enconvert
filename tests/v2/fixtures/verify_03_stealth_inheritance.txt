@@ -1,0 +1,76 @@
+Sprint F0.5 - verification item 3: stealth inheritance (raw context vs arun)
+Date measured: 2026-06-06
+Environment: macOS, Python 3.13.3, venv at api/gateway/.venv
+Pins: crawl4ai==0.8.9, playwright==1.57.0, playwright-stealth==2.0.0
+
+Method:
+  Path A: BrowserManager.get_context() -> context.new_page() -> page.goto(creepjs) -> evaluate signals
+  Path B: BrowserManager.get_crawler().arun(creepjs) with after_goto hook evaluating signals
+  Signals JS evaluates: navigator.webdriver, webdriver descriptor on Navigator.prototype,
+    navigator.userAgent, navigator.languages, navigator.plugins.length,
+    typeof window.chrome, navigator.pdfViewerEnabled,
+    navigator.permissions.query(notifications).state
+
+Crawl4AI internals check:
+  crawler.crawler_strategy.browser_manager.browser type: Browser
+  hasattr(crawler.crawler_strategy, 'browser'): False
+  (Plan doc claims crawler_strategy.browser exists -- this is stale in crawl4ai 0.8.9)
+
+Path A signals (raw BrowserManager.get_context() page):
+{
+    "navigator_webdriver": false,
+    "webdriver_descriptor_on_prototype": "{\"enumerable\":true,\"configurable\":true,\"get\":\"function\"}",
+    "navigator_userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "navigator_languages": "[\"en-US\"]",
+    "navigator_plugins_length": 5,
+    "typeof_window_chrome": "object",
+    "navigator_pdfViewerEnabled": true,
+    "permissions_notifications": "prompt"
+}
+  trust score: unavailable (element not found in DOM)
+  navigator.webdriver stealthed: True
+
+Path B signals (crawl4ai arun() page, via after_goto hook):
+{
+    "navigator_webdriver": false,
+    "webdriver_descriptor_on_prototype": "{\"enumerable\":true,\"configurable\":true,\"get\":\"function\"}",
+    "navigator_userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/116.0.0.0 Safari/537.36",
+    "navigator_languages": "[\"en-US\",\"en\"]",
+    "navigator_plugins_length": 5,
+    "typeof_window_chrome": "object",
+    "navigator_pdfViewerEnabled": true,
+    "permissions_notifications": "default"
+}
+  trust score: unavailable (element not found in DOM)
+  navigator.webdriver stealthed: True
+
+Signal-by-signal comparison (Path A vs Path B):
+  navigator_languages: PathA='["en-US"]' != PathB='["en-US","en"]'
+  navigator_pdfViewerEnabled: PathA=True == PathB=True
+  navigator_plugins_length: PathA=5 == PathB=5
+  navigator_userAgent: PathA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' != PathB='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/116.0.0.0 Safari/537.36'
+  navigator_webdriver: PathA=False == PathB=False
+  permissions_notifications: PathA='prompt' != PathB='default'
+  typeof_window_chrome: PathA='object' == PathB='object'
+  webdriver_descriptor_on_prototype: PathA='{"enumerable":true,"configurable":true,"get":"function"}' == PathB='{"enumerable":true,"configurable":true,"get":"function"}'
+
+Plan expectation (section A2):
+  Path A: navigator.webdriver == true (un-stealthed, bot visible)
+  Path B: navigator.webdriver == false/undefined (stealthed)
+  Decisive signal: navigator.webdriver
+
+Status: PASS - decisive signal (navigator.webdriver) is stealthed
+on both paths.
+Verified cause (adversarial review 2026-06-06): crawl4ai 0.8.9
+passes --disable-blink-features=AutomationControlled UNCONDITIONALLY
+at browser launch (crawl4ai browser_manager.py build_browser_flags /
+_build_browser_args), so webdriver suppression is browser-process-wide
+and raw get_context()/new_page() pages inherit it. The flag is not
+even gated on enable_stealth.
+Caveat: only this launch-flag layer is global. The per-page
+playwright_stealth JS overlay (_apply_stealth_to_page) runs ONLY on
+arun() pages; raw pages lack UA/languages/permissions coherence
+(observed: permissions 'prompt' vs 'default', different UA strings).
+Raw-context pages remain PARTIALLY stealthed until Group F migrates
+V1 converters to arun(); the get_page_with_stealth() shim remains
+the documented fallback (plan section A2).
