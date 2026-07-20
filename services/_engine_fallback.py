@@ -1,4 +1,4 @@
-"""Fallback engine primitives for the OPEN (self-hosted) build of Enconvert.
+"""Fallback engine primitives for the OPEN (self-hosted) build of EnConvert.
 
 This module exists ONLY in the public mirror. In the private/cloud build the
 real conversion engine — the stealth render ladder, TLS-impersonation fetch,
@@ -23,7 +23,7 @@ from fastapi import HTTPException
 
 
 class CloudEngineRequired(HTTPException):
-    """A capability that only the Enconvert cloud engine provides was requested.
+    """A capability that only the EnConvert cloud engine provides was requested.
 
     Surfaces as HTTP 501 (Not Implemented) in the self-hosted build so callers
     can distinguish "unsupported here" from a genuine failure.
@@ -33,7 +33,7 @@ class CloudEngineRequired(HTTPException):
         super().__init__(
             status_code=501,
             detail=(
-                f"'{feature}' requires the Enconvert cloud engine, which is not "
+                f"'{feature}' requires the EnConvert cloud engine, which is not "
                 f"part of the open-source self-hosted build. Use the hosted API "
                 f"at https://enconvert.com for advanced rendering and extraction."
             ),

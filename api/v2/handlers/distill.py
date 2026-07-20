@@ -81,7 +81,7 @@ async def distill(
         # Full detail to server logs only; the client gets a generic
         # message + the operation_id for support correlation. Raw
         # exception text can leak internal paths / library internals
-        # (Playwright, anthropic, SQLAlchemy) — never echo it.
+        # (Playwright, SQLAlchemy, etc.) — never echo it.
         logger.exception("/v2/distill failed (operation %s)", operation_id)
         await _mark_activity(activity_id, "Failed", start)
         raise HTTPException(

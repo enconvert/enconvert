@@ -1,6 +1,6 @@
 """Pydantic models for POST /v2/distill (Task H.5).
 
-``/v2/distill`` is Firecrawl ``/extract`` for Enconvert: schema-driven
+``/v2/distill`` is Firecrawl ``/extract`` for EnConvert: schema-driven
 structured extraction with a two-pass engine. The first pass is a fast,
 free CSS extraction (Crawl4AI ``JsonCssExtractionStrategy``) driven by
 caller-supplied selectors; any field the CSS pass leaves missing or empty
@@ -289,7 +289,7 @@ class DistillRequest(BaseModel):
         max_length=2000,
         description="Natural-language description of what to extract. When "
         "given without a 'schema', the extraction schema is synthesized from "
-        "this prompt (single-model, Haiku). Ignored when 'schema' is present.",
+        "this prompt (single-model LLM). Ignored when 'schema' is present.",
     )
     css_schema: Optional[CssSchema] = None
     # Render knobs (subset of /v2/perceive); distill needs only the DOM.

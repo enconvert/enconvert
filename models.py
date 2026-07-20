@@ -289,7 +289,7 @@ class Plan(SQLModel, table=True):
     watch_enabled: bool = False
     max_watchers: int = 0
     llm_extraction_enabled: bool = False
-    agent_model_tier: str = Field(default="none", max_length=20)  # none | haiku | both
+    agent_model_tier: str = Field(default="none", max_length=20)  # LLM agent tier selector
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         nullable=False,
@@ -392,7 +392,7 @@ class UsagePeriod(SQLModel, table=True):
     watch_checks: int = 0
     lookup_queries: int = 0
     distill_operations: int = 0
-    # NUMERIC(12,4) cents: a single Haiku 4.5 call costs a fraction of a cent,
+    # NUMERIC(12,4) cents: a single LLM call costs a fraction of a cent,
     # so INTEGER cents would round real costs to zero and break the F.6 gate.
     llm_cost_cents: Decimal = Field(
         default=Decimal("0"),

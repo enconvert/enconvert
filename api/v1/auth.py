@@ -210,7 +210,7 @@ async def get_branding(
     user: dict = Depends(get_current_user),
 ):
     """
-    Return whether widget embeds must show the 'Powered by Enconvert' branding.
+    Return whether widget embeds must show the 'Powered by EnConvert' branding.
 
     True for free plans (branding cannot be hidden), False for paid plans
     (the embedder may choose to hide it via plugin settings).

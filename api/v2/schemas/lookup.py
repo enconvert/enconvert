@@ -1,6 +1,6 @@
 """Pydantic models for POST /v2/lookup (Task H.3).
 
-``/v2/lookup`` is Firecrawl ``/search`` for Enconvert: it runs a Serper
+``/v2/lookup`` is Firecrawl ``/search`` for EnConvert: it runs a Serper
 query in one of six categories and, optionally, auto-perceives the top-N
 result URLs through ``/v2/perceive`` so an agent gets both the SERP and
 the page content in a single round trip.

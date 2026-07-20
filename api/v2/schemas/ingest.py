@@ -1,6 +1,6 @@
 """Pydantic models for POST/GET/DELETE /v2/ingest (Task H.7).
 
-``/v2/ingest`` is Firecrawl ``/crawl`` + chunking for Enconvert: it turns a
+``/v2/ingest`` is Firecrawl ``/crawl`` + chunking for EnConvert: it turns a
 site (or an explicit URL list) into RAG-ready chunks and emits a single
 JSONL file (LangChain ``JSONLoader`` / LlamaIndex ``SimpleDirectoryReader``
 / vector-DB bulk-import compatible). It is ALWAYS asynchronous — per-page

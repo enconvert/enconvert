@@ -1,51 +1,53 @@
-<h1 align="center">Enconvert</h1>
+<h1 align="center">EnConvert</h1>
 
 <p align="center">
-  <b>Open-source API to convert anything on the web into clean, AI-ready data.</b><br/>
-  URLs and documents → PDF, screenshots, Markdown, and structured JSON — through one API.
+  <b>The web lies to your agent. EnConvert doesn't.</b><br/>
+  One API reads any file (46 formats) and any page into clean Markdown, JSON, screenshots, or PDF — and tells you when a read was blocked.
 </p>
 
 <p align="center">
   <a href="https://github.com/enconvert/enconvert/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
+  <a href="https://github.com/enconvert/enconvert/releases"><img src="https://img.shields.io/github/v/release/enconvert/enconvert?include_prereleases" alt="Release"></a>
   <a href="https://github.com/enconvert/enconvert/stargazers"><img src="https://img.shields.io/github/stars/enconvert/enconvert?style=social" alt="GitHub stars"></a>
 </p>
 
 ---
 
-Enconvert is a conversion engine built for people who need reliable, structured output from messy inputs. Point it at a URL or hand it a file, and get back a pixel-accurate PDF, a full-page screenshot, clean Markdown, or JSON matching a schema you define.
+An LLM is brilliant and blind. Hand it a URL and it will confidently summarize a Cloudflare challenge, a cookie wall, or an empty SPA shell — and never tell you. Scrapers stop at pages. Converters stop at files. Your agent needs both, and it shouldn't take two vendors to get them.
 
-It is **open source and available as a hosted service**. Run it yourself under the AGPL-3.0, or skip the ops and use the managed API at [enconvert.com](https://enconvert.com).
+EnConvert is the conversion and reading layer for agents: point it at a URL or a file, get back clean Markdown, JSON, a screenshot, or a PDF. This repository is the **open-source API** — the orchestration, routing, storage, jobs, and self-hostable engine — under the AGPL-3.0. The managed cloud at [enconvert.com](https://enconvert.com) runs this same code plus the advanced rendering engine and the quality scoring that make reads trustworthy at scale.
 
-## Why Enconvert?
+## Six verbs, one API
 
-- **One API, every format.** URL → PDF, HTML → PDF, document → PDF, page → screenshot, anything → Markdown, page → structured JSON.
-- **Built for automation.** Async jobs, batch conversions, webhooks, and change-watching for pages you care about.
-- **Developer-first.** Clean REST endpoints, typed SDKs, signed download URLs, sensible defaults.
-- **Open source.** Developed in the open under the AGPL-3.0. Self-host the whole orchestration layer with zero reliance on our servers.
+| Verb | | What it does |
+|---|---|---|
+| **perceive** | `URL → MD/JSON/PNG/PDF` | Render any URL once and return Markdown, HTML, a screenshot, a PDF, links, and structured data. |
+| **convert** | `FILE → FILE` | Open 46 file types in one request — PDF, DOCX, XLSX, PPTX, HEIC, SVG, CSV, and more, in and out. |
+| **discover** | `SITE → URL MAP` | Map every URL on a site from its sitemap and an HTTP crawl, without rendering a page. |
+| **lookup** | `QUERY → RESULTS` | Search the live web (web, news, scholar, maps) from inside the conversation. |
+| **distill** | `SCHEMA → JSON` | Pass a schema, get structured data back from any page. |
+| **ingest** | `SITE → CHUNKS` | Crawl a whole site into RAG-ready JSONL chunks in one call. |
+| **watch** | `PAGE → DIFF` | Get a webhook the moment a page you track changes. |
 
 ## Quick start (hosted)
 
 Grab an API key at [enconvert.com](https://enconvert.com), then:
 
 ```bash
-curl -X POST https://api.enconvert.com/v1/convert/url-to-pdf \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}'
-```
-
-Turn a live page into clean Markdown for your LLM pipeline:
-
-```bash
+# perceive: a live page → clean Markdown for your LLM pipeline
 curl -X POST https://api.enconvert.com/v2/perceive \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" -H "Content-Type: application/json" \
   -d '{"url": "https://example.com", "outputs": ["markdown"]}'
 ```
 
-## Self-hosting
+```bash
+# convert: any file → PDF
+curl -X POST https://api.enconvert.com/v1/convert/url-to-pdf \
+  -H "X-API-Key: YOUR_API_KEY" -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
+```
 
-Enconvert is self-hostable with Docker in a couple of commands:
+## Self-hosting
 
 ```bash
 git clone https://github.com/enconvert/enconvert.git
@@ -53,40 +55,42 @@ cd enconvert
 docker compose up
 ```
 
-See **[SELF_HOST.md](./SELF_HOST.md)** for configuration and the full capability list.
+The self-hosted build handles the commodity conversions out of the box and renders pages with a plain headless browser. See **[SELF_HOST.md](./SELF_HOST.md)** for the full capability list and configuration.
 
-The self-hosted build does basic rendering with a plain headless browser and handles all the commodity conversions out of the box. The **cloud version at [enconvert.com](https://enconvert.com) adds advanced rendering** — stealth/anti-bot page loading for protected sites, browser actions, geolocation and mobile emulation, LLM-powered structured extraction, and a managed dashboard with teams and billing.
+## Every read comes with a receipt
+
+The hardest part of reading the web isn't fetching a page — it's knowing whether what came back is real. The **EnConvert cloud** scores every read (`render_quality`, 0.0–1.0): a blocked or login-walled page comes back *flagged*, not passed off as content. That plus real anti-bot rendering, cross-result answer synthesis, and semantic change diffing is what the cloud adds on top of this open core.
 
 ## Open source vs Cloud
 
 | | Self-hosted (this repo) | Cloud ([enconvert.com](https://enconvert.com)) |
 |---|:---:|:---:|
-| URL / HTML / doc → PDF | ✅ | ✅ |
-| Full-page screenshots | ✅ | ✅ |
-| Anything → Markdown | ✅ | ✅ |
-| Image & lightweight conversions | ✅ | ✅ |
-| URL discovery (sitemap + crawl) | ✅ | ✅ |
-| Change watching (content-hash) | ✅ | ✅ |
-| Async jobs, batch, webhooks | ✅ | ✅ |
-| Advanced anti-bot / stealth rendering | — | ✅ |
-| Browser actions, mobile, geolocation | — | ✅ |
-| LLM structured extraction | — | ✅ |
-| Semantic change diffing | — | ✅ |
+| 46-format file conversion | ✅ | ✅ |
+| perceive: URL → Markdown / screenshot / PDF | basic render | **Chromium engine, scored** |
+| discover: site → URL map | ✅ | ✅ |
+| lookup: live web search | results only | **+ render, extract & cited answers** |
+| ingest: site → RAG chunks | ✅ | ✅ |
+| watch: change monitoring | content-hash | **semantic diff** |
+| Anti-bot / stealth rendering | — | ✅ |
+| `render_quality` read scoring | — | ✅ |
+| distill: schema → structured JSON | CSS pass | **+ LLM extraction** |
 | Managed dashboard, teams, billing | — | ✅ |
+
+The eyes are real today. The advanced engine, the scoring, and the semantic layer live in the cloud — this repo is the honest open core they run on.
 
 ## SDKs
 
 Official SDKs are MIT-licensed and default to the cloud API:
 
-- [Node / TypeScript](https://github.com/enconvert/node-sdk)
-- [Model Context Protocol server](https://github.com/enconvert/mcp)
+- [Node / TypeScript SDK](https://github.com/enconvert/node-sdk)
+- [Model Context Protocol server](https://github.com/enconvert/mcp) — one-command install for Claude, Cursor, and Windsurf
 
 ## License
 
-Enconvert is open source under the **AGPL-3.0** license — see [LICENSE](./LICENSE). The SDKs and client libraries are licensed under the **MIT License**. The managed cloud service at [enconvert.com](https://enconvert.com) includes additional features.
+EnConvert is open source under **AGPL-3.0** — see [LICENSE](./LICENSE). The SDKs and MCP server are **MIT**. The managed cloud at [enconvert.com](https://enconvert.com) includes additional features.
 
 ---
 
 <p align="center">
-  <sub>Pst — if Enconvert is useful to you, consider leaving a ⭐. It genuinely helps.</sub>
+  <sub>Pst — if EnConvert is useful to you, consider leaving a ⭐. It genuinely helps.</sub>
 </p>

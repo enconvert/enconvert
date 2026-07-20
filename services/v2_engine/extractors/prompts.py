@@ -1,6 +1,6 @@
 """Prompt templates — open-source fallback (empty stubs).
 
-The real prompt engineering ships only in the Enconvert cloud build. The
+The real prompt engineering ships only in the EnConvert cloud build. The
 open fallback's ``schema_llm`` raises ``CloudEngineRequired`` before any
 prompt is needed, so these names exist purely so imports resolve.
 """

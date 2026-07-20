@@ -1,7 +1,7 @@
 """Tier-3 LLM extraction — open-source fallback (cloud-only capability).
 
-The real module runs capped Anthropic Haiku extraction with a layered
-budget ledger; that engine ships only in the Enconvert cloud build. This
+The real module runs a capped, metered LLM extraction engine with a layered
+budget ledger; that engine ships only in the EnConvert cloud build. This
 fallback keeps the PUBLIC surface open callers and tests rely on — the
 result dataclasses (same fields), the skip-reason constants and the
 ``period_cap_cents`` billing helper — while the three async entry points
@@ -22,18 +22,19 @@ from typing import Any, Optional
 
 from services._engine_fallback import CloudEngineRequired
 
-# Model + cap constants: public information (published Anthropic model
-# slug and Enconvert's documented budget caps), kept so imports and
-# verification harnesses resolve against the same names.
-MODEL_SLUG = "claude-haiku-4-5"
+# The extraction model and budget caps are a cloud-only concern and are not
+# part of the open-source build. These placeholders exist purely so imports,
+# the ``period_cap_cents`` helper, and verification harnesses resolve against
+# the same names; the real model and caps live in the EnConvert cloud build.
+MODEL_SLUG = "cloud-managed"
 
-PER_REQUEST_CAP_CENTS = Decimal("5")             # $0.05 per call
-DEFAULT_PERIOD_CAP_CENTS = Decimal("500")        # $5  free/starter/unknown
-ELEVATED_PERIOD_CAP_CENTS = Decimal("2000")      # $20 pro and above
-_ELEVATED_CAP_SLUGS = frozenset({"pro", "business", "enterprise", "admin"})
+PER_REQUEST_CAP_CENTS = Decimal("0")
+DEFAULT_PERIOD_CAP_CENTS = Decimal("0")
+ELEVATED_PERIOD_CAP_CENTS = Decimal("0")
+_ELEVATED_CAP_SLUGS: frozenset[str] = frozenset()
 
 # Skip reasons (ExtractionResult.skipped_reason values in the cloud build).
-SKIP_NOT_CONFIGURED = "anthropic_api_key_not_configured"
+SKIP_NOT_CONFIGURED = "llm_api_key_not_configured"
 SKIP_EMPTY_HTML = "empty_html"
 SKIP_NO_USAGE_PERIOD = "no_active_usage_period"
 SKIP_PERIOD_CAP = "llm_budget_cap_reached"

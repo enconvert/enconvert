@@ -437,7 +437,7 @@ async def run(request: DistillRequest, operation_id: str, user: dict) -> Distill
     synthesized_schema: Optional[dict] = None
     synth_cost = 0.0
     # Prompt-only mode: synthesize the extraction schema from the goal
-    # (single-model Haiku, same reserve-then-settle budget ledger as the
+    # (single-model LLM, same reserve-then-settle budget ledger as the
     # extraction pass). Falls through to the normal two-pass engine.
     if schema is None:
         if not llm_enabled:

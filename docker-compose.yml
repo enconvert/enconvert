@@ -1,4 +1,4 @@
-# Self-hosting stack for the open-source Enconvert gateway.
+# Self-hosting stack for the open-source EnConvert gateway.
 # Local defaults only — change every secret before exposing this to a network.
 services:
   gateway:
@@ -17,8 +17,6 @@ services:
       DO_SPACES_BUCKET: enconvert
       DO_SPACES_REGION: us-east-1
       FORWARDED_ALLOW_IPS: "*"
-      # Optional: bring your own key to enable the basic LLM-extraction path.
-      # ANTHROPIC_API_KEY: ""
     depends_on:
       postgres:
         condition: service_healthy

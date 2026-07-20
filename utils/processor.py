@@ -37,7 +37,7 @@ from models import PdfOptions
 
 # V2 Phase 0: retain rendered HTML in DO Spaces for 90 days. See the
 # Privacy policy for the public disclosure of this retention window
-# and the X-Enconvert-No-Capture opt-out header.
+# and the X-EnConvert-No-Capture opt-out header.
 RENDERED_HTML_RETENTION_HOURS = 90 * 24
 
 import logging
@@ -238,7 +238,7 @@ async def process_single_async(
     Sends email notification and optional customer callback when complete.
 
     `no_capture` skips the V2 Phase 0 rendered-HTML capture for callers
-    that sent `X-Enconvert-No-Capture: true`. Counters are still skipped
+    that sent `X-EnConvert-No-Capture: true`. Counters are still skipped
     because instrumentation is not created in that path.
     """
     url = request_data.get("url", "")
@@ -641,7 +641,7 @@ async def handle_url_conversion(
     job_id = data.get("job_id")
 
     # V2 Phase 0 opt-out: consumers can disable rendered-HTML capture
-    # per-request with `X-Enconvert-No-Capture: true`. The Privacy policy
+    # per-request with `X-EnConvert-No-Capture: true`. The Privacy policy
     # documents this header alongside the 90-day retention window.
     no_capture = header_opts_out(request.headers)
 

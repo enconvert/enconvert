@@ -107,7 +107,7 @@ def reserve_llm_budget(
     booking — committed together or not at all, so SUM(ledger) always
     equals the aggregate. A DUPLICATE reserve key fails CLOSED (returns
     None, no API call): the original reservation stands, and a second
-    unbooked Anthropic call must never be made. Empty key = legacy
+    unbooked LLM call must never be made. Empty key = legacy
     unledgered behavior (kept for direct callers/tests; prod callers
     always pass one).
     """
