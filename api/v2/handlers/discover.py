@@ -22,6 +22,7 @@ from api.v2.schemas.discover import DiscoverRequest, DiscoverResponse
 from monitoring import posthog_client
 from monitoring.metrics import log_activity_start, update_activity_status
 from services.v2_engine import discover_flow
+from utils.error_capture import error_fields
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +49,15 @@ async def discover(
 
     try:
         response = await discover_flow.run(body, user)
-    except HTTPException:
-        await _mark_activity(activity_id, "Failed", start)
+    except HTTPException as exc:
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise
     except Exception as exc:
         # Full detail to server logs only; the client gets a generic
         # message. Raw exception text can leak internal paths / library
         # internals (httpx, crawl4ai) — never echo it.
         logger.exception("/v2/discover failed for %s", body.url)
-        await _mark_activity(activity_id, "Failed", start)
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise HTTPException(
             status_code=500,
             detail="URL discovery failed. Please try again or contact support.",
@@ -80,6 +81,8 @@ async def _mark_activity(
     start: datetime,
     *,
     output_file_size: int = 0,
+    error: BaseException | None = None,
+    error_context: str | None = None,
 ) -> None:
     """Best-effort activity update; never masks the request outcome."""
     duration = (datetime.now(timezone.utc) - start).total_seconds()
@@ -90,6 +93,7 @@ async def _mark_activity(
             output_file_size=output_file_size,
             duration=duration,
             count_usage=False,  # coexistence rule 3: V2 never bills V1
+            **error_fields(error, context=error_context),
         )
     except Exception:  # noqa: BLE001
         logger.warning("activity update failed", exc_info=True)

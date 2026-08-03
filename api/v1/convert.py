@@ -35,6 +35,8 @@ from services.pdf import (
     convert_to_pdf as anything_to_pdf_converter,
 )
 from services.conversion_errors import ConversionTimeoutError, UnsupportedOptionError
+from utils import memory
+from utils.error_capture import error_fields
 
 
 import logging
@@ -56,6 +58,16 @@ _CONVERSION_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_CONVERSIONS)
 # 1GB. Counts running + waiting conversions; excess gets 503 + Retry-After.
 _MAX_PENDING_CONVERSIONS = int(os.getenv("MAX_PENDING_CONVERSIONS", "10"))
 _pending_conversions = 0
+
+# Byte-weighted admission gate alongside the request-count gate above: ten
+# queued 1KB uploads and ten queued 150MB uploads are NOT the same OOM risk.
+# Caps the sum of upload bytes held by running + queued conversions; excess
+# gets the same 503 + Retry-After. 256MB default fits the 1GB droplet with
+# Chromium (~250MB) and the resident baseline (~150MB) alongside it.
+_MAX_PENDING_BYTES = int(
+    os.getenv("MAX_PENDING_CONVERSION_BYTES", str(256 * 1024 * 1024))
+)
+_pending_bytes = 0
 
 
 def _capture_upload_rejected(
@@ -315,8 +327,11 @@ async def forward_to_backend(
     # Create conversion job row (enables polling on timeout for any key type)
     needs_polling = True
     if needs_polling and job_id:
-        from utils.conversion_jobs import create_conversion_job
-        create_conversion_job(job_id, str(user["id"]))
+        from utils.conversion_jobs import create_conversion_job, JobIdConflict
+        try:
+            create_conversion_job(job_id, str(user["id"]))
+        except JobIdConflict:
+            raise HTTPException(409, "job_id already in use")
 
     start_time = datetime.now(timezone.utc)
 
@@ -333,18 +348,23 @@ async def forward_to_backend(
         needs_filename = converter_info.get("needs_filename", False)
 
         # Fail-fast admission gate + bounded concurrency (see module constants).
-        # The pending counter spans the semaphore wait AND the CPU work, capping
-        # how many request bodies sit in RAM at once. Race-safe: no await
-        # between the check and the increment. The semaphore is held only
-        # around the CPU work, released before the S3 upload below.
-        global _pending_conversions
-        if _pending_conversions >= _MAX_PENDING_CONVERSIONS:
+        # The pending counters span the semaphore wait AND the CPU work, capping
+        # how many request bodies (and how many BYTES of them) sit in RAM at
+        # once. Race-safe: no await between the checks and the increments. The
+        # semaphore is held only around the CPU work, released before the S3
+        # upload below.
+        global _pending_conversions, _pending_bytes
+        if (
+            _pending_conversions >= _MAX_PENDING_CONVERSIONS
+            or _pending_bytes + input_size > _MAX_PENDING_BYTES
+        ):
             raise HTTPException(
                 status_code=503,
                 detail="Server is at capacity. Please retry shortly.",
                 headers={"Retry-After": "10"},
             )
         _pending_conversions += 1
+        _pending_bytes += input_size
         try:
             # Build the call explicitly. The previous if/elif made needs_filename
             # and pdf_options mutually exclusive, so a converter needing both
@@ -361,18 +381,28 @@ async def forward_to_backend(
                 call_kwargs.update(converter_kwargs)
 
             async with _CONVERSION_SEMAPHORE:
+                # The converter has its own reference via call_args; dropping
+                # ours here lets the input bytes free the moment the converter
+                # is done with them (the route passes the read inline, so no
+                # caller frame pins them either).
+                file_content = None
                 if asyncio.iscoroutinefunction(converter_fn):
                     output_bytes = await converter_fn(*call_args, **call_kwargs)
                 else:
                     output_bytes = await asyncio.to_thread(
                         converter_fn, *call_args, **call_kwargs
                     )
+                # Input bytes are no longer needed anywhere below (validators
+                # ran pre-dispatch, size is captured in input_size) — release
+                # the last reference before the S3 upload / response tail.
+                call_args = None
 
                 # Post-processing: grayscale (for file-upload PDF endpoints)
                 if is_pdf_endpoint and pdf_options and pdf_options.grayscale:
                     output_bytes = await convert_to_grayscale(output_bytes)
         finally:
             _pending_conversions -= 1
+            _pending_bytes -= input_size
 
         # Ensure output is bytes
         if isinstance(output_bytes, str):
@@ -508,7 +538,9 @@ async def forward_to_backend(
         # Mark activity as Failed, then re-raise
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         try:
-            await update_activity_status(activity_id, "Failed", duration=duration)
+            await update_activity_status(
+                activity_id, "Failed", duration=duration, **error_fields(e),
+            )
         except Exception:
             pass
         _capture_conversion_failed(
@@ -518,7 +550,7 @@ async def forward_to_backend(
         )
         if needs_polling and job_id:
             from utils.conversion_jobs import update_conversion_job_failure
-            update_conversion_job_failure(job_id, str(e.detail))
+            update_conversion_job_failure(job_id, str(user["id"]), str(e.detail))
         raise
     except ConversionTimeoutError as e:
         # The unoserver/LibreOffice subprocess blew its own time budget. That is
@@ -527,7 +559,9 @@ async def forward_to_backend(
         # `except ValueError` so the mapping survives any future reparenting.
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         try:
-            await update_activity_status(activity_id, "Failed", duration=duration)
+            await update_activity_status(
+                activity_id, "Failed", duration=duration, **error_fields(e),
+            )
         except Exception:
             pass
         _capture_conversion_failed(
@@ -537,13 +571,15 @@ async def forward_to_backend(
         )
         if needs_polling and job_id:
             from utils.conversion_jobs import update_conversion_job_failure
-            update_conversion_job_failure(job_id, str(e))
+            update_conversion_job_failure(job_id, str(user["id"]), str(e))
         raise HTTPException(status_code=504, detail=str(e))
     except ValueError as e:
         # Converter raised a validation error (bad input)
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         try:
-            await update_activity_status(activity_id, "Failed", duration=duration)
+            await update_activity_status(
+                activity_id, "Failed", duration=duration, **error_fields(e),
+            )
         except Exception:
             pass
         _capture_conversion_failed(
@@ -553,12 +589,14 @@ async def forward_to_backend(
         )
         if needs_polling and job_id:
             from utils.conversion_jobs import update_conversion_job_failure
-            update_conversion_job_failure(job_id, str(e))
+            update_conversion_job_failure(job_id, str(user["id"]), str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         try:
-            await update_activity_status(activity_id, "Failed", duration=duration)
+            await update_activity_status(
+                activity_id, "Failed", duration=duration, **error_fields(e),
+            )
         except Exception:
             pass
         _capture_conversion_failed(
@@ -568,8 +606,15 @@ async def forward_to_backend(
         )
         if needs_polling and job_id:
             from utils.conversion_jobs import update_conversion_job_failure
-            update_conversion_job_failure(job_id, str(e))
+            update_conversion_job_failure(job_id, str(user["id"]), str(e))
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    finally:
+        # Memory hygiene (2026-07-28 incident): glibc retains the freed
+        # request buffers in its arenas, so a large conversion permanently
+        # inflated the resident footprint. Hand the pages back to the kernel
+        # once the response frame has exited; small payloads skip this
+        # entirely. See utils/memory.py.
+        memory.schedule_release(input_size, reason=f"convert:{endpoint}")
 
 
 
@@ -767,10 +812,9 @@ async def json_to_xml(
     """
     #check_rate_limits(request, user, "/v1/convert/json-to-xml")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "json-to-xml", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "json-to-xml", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/xml-to-json")
 async def xml_to_json(
@@ -790,10 +834,9 @@ async def xml_to_json(
     """
     #check_rate_limits(request, user, "/v1/convert/xml-to-json")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "xml-to-json", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "xml-to-json", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/json-to-yaml")
 async def json_to_yaml(
@@ -813,10 +856,9 @@ async def json_to_yaml(
     """
     #check_rate_limits(request, user, "/v1/convert/json-to-yaml")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "json-to-yaml", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "json-to-yaml", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/yaml-to-json")
 async def yaml_to_json(
@@ -836,10 +878,9 @@ async def yaml_to_json(
     """
     #check_rate_limits(request, user, "/v1/convert/yaml-to-json")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "yaml-to-json", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "yaml-to-json", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/csv-to-json")
 async def csv_to_json(
@@ -859,10 +900,9 @@ async def csv_to_json(
     """
     #check_rate_limits(request, user, "/v1/convert/csv-to-json")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "csv-to-json", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "csv-to-json", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/json-to-csv")
 async def json_to_csv(
@@ -880,10 +920,9 @@ async def json_to_csv(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "json-to-csv", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "json-to-csv", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/json-to-toml")
 async def json_to_toml(
@@ -903,10 +942,9 @@ async def json_to_toml(
     """
     #check_rate_limits(request, user, "/v1/convert/json-to-toml")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "json-to-toml", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "json-to-toml", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/toml-to-json")
 async def toml_to_json(
@@ -926,10 +964,9 @@ async def toml_to_json(
     """
     #check_rate_limits(request, user, "/v1/convert/toml-to-json")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "toml-to-json", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "toml-to-json", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/csv-to-xml")
 async def csv_to_xml(
@@ -949,10 +986,9 @@ async def csv_to_xml(
     """
     #check_rate_limits(request, user, "/v1/convert/csv-to-xml")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "csv-to-xml", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "csv-to-xml", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/xml-to-csv")
 async def xml_to_csv(
@@ -972,10 +1008,9 @@ async def xml_to_csv(
     """
     #check_rate_limits(request, user, "/v1/convert/xml-to-csv")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "xml-to-csv", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "xml-to-csv", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/markdown-to-html")
 async def markdown_to_html(
@@ -995,10 +1030,9 @@ async def markdown_to_html(
     """
     #check_rate_limits(request, user, "/v1/convert/markdown-to-html")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "markdown-to-html", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "markdown-to-html", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 # Document converters
 @router.post("/doc-to-pdf")
@@ -1025,13 +1059,11 @@ async def doc_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/doc-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "doc-to-pdf")
 
-    return await forward_to_backend(request, "doc-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "doc-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/excel-to-pdf")
 async def excel_to_pdf(
@@ -1057,13 +1089,11 @@ async def excel_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/excel-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "excel-to-pdf")
 
-    return await forward_to_backend(request, "excel-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "excel-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/html-to-pdf")
 async def html_to_pdf(
@@ -1085,9 +1115,7 @@ async def html_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/html-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = None
     if pdf_options:
@@ -1096,7 +1124,7 @@ async def html_to_pdf(
         except (json_lib.JSONDecodeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid pdf_options: {str(e)}")
 
-    return await forward_to_backend(request, "html-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "html-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/markdown-to-pdf")
 async def markdown_to_pdf(
@@ -1118,9 +1146,7 @@ async def markdown_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/markdown-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = None
     if pdf_options:
@@ -1129,7 +1155,7 @@ async def markdown_to_pdf(
         except (json_lib.JSONDecodeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid pdf_options: {str(e)}")
 
-    return await forward_to_backend(request, "markdown-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "markdown-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/anything-to-markdown")
 async def anything_to_markdown(
@@ -1152,10 +1178,9 @@ async def anything_to_markdown(
         output_filename: Optional custom output name (defaults to input name .md).
         direct_download: If True (default), return the file; else JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "anything-to-markdown", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "anything-to-markdown", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 
 @router.post("/anything-to-pdf")
@@ -1192,8 +1217,6 @@ async def anything_to_pdf(
     # omit entirely. Must stay above the read() below.
     validate_file_size(request, user, file)
 
-    content = await file.read()
-
     parsed_pdf_options = None
     if pdf_options:
         try:
@@ -1209,7 +1232,7 @@ async def anything_to_pdf(
             raise HTTPException(status_code=400, detail=str(e))
 
     return await forward_to_backend(
-        request, "anything-to-pdf", user, content, file.filename,
+        request, "anything-to-pdf", user, await file.read(), file.filename,
         output_filename, direct_download, job_id, pdf_options=parsed_pdf_options,
     )
 
@@ -1255,10 +1278,9 @@ async def generate_thumbnail(
     """
     #check_rate_limits(request, user, "/v1/convert/thumbnail")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "thumbnail", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "thumbnail", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/video")
 async def transcode_video(
@@ -1278,10 +1300,9 @@ async def transcode_video(
     """
     #check_rate_limits(request, user, "/v1/convert/video")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "video", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "video", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 # AI converters
 @router.post("/ocr")
@@ -1302,10 +1323,9 @@ async def extract_text_ocr(
     """
     #check_rate_limits(request, user, "/v1/convert/ocr")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "ocr", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "ocr", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/speech-to-text")
 async def transcribe_audio(
@@ -1325,10 +1345,9 @@ async def transcribe_audio(
     """
     #check_rate_limits(request, user, "/v1/convert/speech-to-text")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "speech-to-text", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "speech-to-text", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/text-to-speech")
 async def synthesize_speech(
@@ -1348,10 +1367,9 @@ async def synthesize_speech(
     """
     #check_rate_limits(request, user, "/v1/convert/text-to-speech")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "text-to-speech", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "text-to-speech", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 
 @router.get("/status/{job_id}")
@@ -1420,30 +1438,31 @@ async def download_file(
 ):
     """Proxy file download from DO Spaces through the API.
     Avoids CORS issues and prevents auto-download with garbled filenames
-    by setting Content-Disposition: inline with the correct filename."""
-    from utils.storage import DO_SPACES_BUCKET, DO_SPACES_REGION, DO_SPACES_KEY, DO_SPACES_SECRET, ENV_PREFIX
-    import boto3
+    by setting Content-Disposition: inline with the correct filename.
+
+    Streams the object through in ~64KB chunks: buffering the whole file
+    (up to the 150MB Business ceiling) held the entire payload in the heap
+    for the whole client transfer — a slow client pinned it for minutes —
+    and glibc kept the freed pages afterwards (2026-07-28 memory incident).
+    """
+    from fastapi.responses import StreamingResponse
+    from utils.storage import DO_SPACES_BUCKET, get_s3_client
+    from utils.storage import ENV_PREFIX
     from pathlib import Path
 
     expected_prefix = f"{ENV_PREFIX}/files/{str(user['id'])}/"
     if not object_key.startswith(expected_prefix):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    client = boto3.client(
-        's3',
-        region_name=DO_SPACES_REGION,
-        endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
-        aws_access_key_id=DO_SPACES_KEY,
-        aws_secret_access_key=DO_SPACES_SECRET,
-    )
+    client = get_s3_client()
 
     try:
         s3_obj = client.get_object(Bucket=DO_SPACES_BUCKET, Key=object_key)
     except client.exceptions.NoSuchKey:
         raise HTTPException(status_code=404, detail="File not found")
 
-    content = s3_obj["Body"].read()
     content_type = s3_obj.get("ContentType", "application/octet-stream")
+    content_length = s3_obj.get("ContentLength")
     filename = Path(object_key).name
 
     posthog_client.capture(
@@ -1451,20 +1470,24 @@ async def download_file(
         "file_download_proxied",
         {
             "content_type": content_type,
-            "file_size_bytes": len(content),
+            "file_size_bytes": content_length,
             "key_type": user.get("key_type", "unknown"),
             "source": posthog_client.source_from(user, request),
         },
         posthog_client.group_of(user["id"]),
     )
 
-    return Response(
-        content=content,
+    headers = {
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "X-Filename": filename,
+    }
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
+
+    return StreamingResponse(
+        s3_obj["Body"].iter_chunks(chunk_size=64 * 1024),
         media_type=content_type,
-        headers={
-            "Content-Disposition": f'inline; filename="{filename}"',
-            "X-Filename": filename,
-        },
+        headers=headers,
     )
 
 
@@ -1492,13 +1515,11 @@ async def ppt_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/ppt-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "ppt-to-pdf")
 
-    return await forward_to_backend(request, "ppt-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "ppt-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/odt-to-pdf")
 async def odt_to_pdf(
@@ -1524,13 +1545,11 @@ async def odt_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/odt-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "odt-to-pdf")
 
-    return await forward_to_backend(request, "odt-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "odt-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/ods-to-pdf")
 async def ods_to_pdf(
@@ -1556,13 +1575,11 @@ async def ods_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/ods-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "ods-to-pdf")
 
-    return await forward_to_backend(request, "ods-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "ods-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/odp-to-pdf")
 async def odp_to_pdf(
@@ -1588,13 +1605,11 @@ async def odp_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/odp-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "odp-to-pdf")
 
-    return await forward_to_backend(request, "odp-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "odp-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/ots-to-pdf")
 async def ots_to_pdf(
@@ -1620,13 +1635,11 @@ async def ots_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/ots-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "ots-to-pdf")
 
-    return await forward_to_backend(request, "ots-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "ots-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/pages-to-pdf")
 async def pages_to_pdf(
@@ -1652,13 +1665,11 @@ async def pages_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/pages-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "pages-to-pdf")
 
-    return await forward_to_backend(request, "pages-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "pages-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 @router.post("/numbers-to-pdf")
 async def numbers_to_pdf(
@@ -1684,13 +1695,11 @@ async def numbers_to_pdf(
     """
     #check_rate_limits(request, user, "/v1/convert/numbers-to-pdf")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
-
-    content = await file.read()
+    validate_file_size(request, user, file)
 
     parsed_pdf_options = _parse_office_pdf_options(pdf_options, file.filename, "numbers-to-pdf")
 
-    return await forward_to_backend(request, "numbers-to-pdf", user, content, file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
+    return await forward_to_backend(request, "numbers-to-pdf", user, await file.read(), file.filename, output_filename, direct_download, job_id, pdf_options=parsed_pdf_options)
 
 # @router.post("/key-to-pdf")
 # async def key_to_pdf(
@@ -1743,10 +1752,9 @@ async def jpeg_to_png(
     """
     #check_rate_limits(request, user, "/v1/convert/jpeg-to-png")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "jpeg-to-png", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "jpeg-to-png", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/png-to-jpeg")
 async def png_to_jpeg(
@@ -1766,10 +1774,9 @@ async def png_to_jpeg(
     """
     #check_rate_limits(request, user, "/v1/convert/png-to-jpeg")
     # check_abuse_patterns(request, user)
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "png-to-jpeg", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "png-to-jpeg", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/jpeg-to-svg")
 async def jpeg_to_svg(
@@ -1787,10 +1794,9 @@ async def jpeg_to_svg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "jpeg-to-svg", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "jpeg-to-svg", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/svg-to-jpeg")
 async def svg_to_jpeg(
@@ -1812,7 +1818,7 @@ async def svg_to_jpeg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
     content = await file.read()
     validate_svg_dimensions(width, height, content)
@@ -1836,10 +1842,9 @@ async def jpeg_to_heic(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "jpeg-to-heic", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "jpeg-to-heic", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/heic-to-jpeg")
 async def heic_to_jpeg(
@@ -1857,10 +1862,9 @@ async def heic_to_jpeg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "heic-to-jpeg", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "heic-to-jpeg", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/jpeg-to-webp")
 async def jpeg_to_webp(
@@ -1878,10 +1882,9 @@ async def jpeg_to_webp(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "jpeg-to-webp", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "jpeg-to-webp", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/webp-to-jpeg")
 async def webp_to_jpeg(
@@ -1899,10 +1902,9 @@ async def webp_to_jpeg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "webp-to-jpeg", user, content, file.filename, output_filename, direct_download, job_id)    
+    return await forward_to_backend(request, "webp-to-jpeg", user, await file.read(), file.filename, output_filename, direct_download, job_id)    
   
 
 @router.post("/png-to-svg")
@@ -1921,10 +1923,9 @@ async def png_to_svg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "png-to-svg", user, content, file.filename, output_filename, direct_download, job_id)    
+    return await forward_to_backend(request, "png-to-svg", user, await file.read(), file.filename, output_filename, direct_download, job_id)    
   
 @router.post("/svg-to-png")
 async def svg_to_png(
@@ -1946,7 +1947,7 @@ async def svg_to_png(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
     content = await file.read()
     validate_svg_dimensions(width, height, content)
@@ -1969,10 +1970,9 @@ async def png_to_heic(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "png-to-heic", user, content, file.filename, output_filename, direct_download, job_id)    
+    return await forward_to_backend(request, "png-to-heic", user, await file.read(), file.filename, output_filename, direct_download, job_id)    
   
 @router.post("/heic-to-png")
 async def heic_to_png(
@@ -1990,10 +1990,9 @@ async def heic_to_png(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "heic-to-png", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "heic-to-png", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/png-to-webp")
 async def png_to_webp(
@@ -2011,10 +2010,9 @@ async def png_to_webp(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "png-to-webp", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "png-to-webp", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/webp-to-png")
 async def webp_to_png(
@@ -2032,10 +2030,9 @@ async def webp_to_png(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "webp-to-png", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "webp-to-png", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/svg-to-heic")
 async def svg_to_heic(
@@ -2053,10 +2050,9 @@ async def svg_to_heic(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "svg-to-heic", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "svg-to-heic", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/heic-to-svg")
 async def heic_to_svg(
@@ -2074,10 +2070,9 @@ async def heic_to_svg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "heic-to-svg", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "heic-to-svg", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
  
 @router.post("/svg-to-webp")
@@ -2100,7 +2095,7 @@ async def svg_to_webp(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
     content = await file.read()
     validate_svg_dimensions(width, height, content)
@@ -2123,10 +2118,9 @@ async def webp_to_svg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "webp-to-svg", user, content, file.filename, output_filename, direct_download, job_id) 
+    return await forward_to_backend(request, "webp-to-svg", user, await file.read(), file.filename, output_filename, direct_download, job_id) 
 
 
 @router.post("/heic-to-webp")
@@ -2145,10 +2139,9 @@ async def heic_to_webp(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "heic-to-webp", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "heic-to-webp", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 @router.post("/webp-to-heic")
 async def webp_to_heic(
@@ -2166,10 +2159,9 @@ async def webp_to_heic(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "webp-to-heic", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "webp-to-heic", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 
 @router.post("/pdf-to-jpeg")
@@ -2188,10 +2180,9 @@ async def pdf_to_jpeg(
         output_filename: Optional custom output filename. If not provided, uses input filename with new extension.
         direct_download: If True (default), return file directly. Set to False for JSON metadata.
     """
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
-    return await forward_to_backend(request, "pdf-to-jpeg", user, content, file.filename, output_filename, direct_download, job_id)
+    return await forward_to_backend(request, "pdf-to-jpeg", user, await file.read(), file.filename, output_filename, direct_download, job_id)
 
 
 @router.post("/compress-image")
@@ -2223,11 +2214,10 @@ async def compress_image(
     # placement rationale as _parse_office_pdf_options.
     if target_size_kb is not None and target_size_kb < 1:
         raise HTTPException(status_code=400, detail="target_size_kb must be a positive integer")
-    validate_file_size(request, user)
+    validate_file_size(request, user, file)
 
-    content = await file.read()
     return await forward_to_backend(
-        request, "compress-image", user, content, file.filename, output_filename,
+        request, "compress-image", user, await file.read(), file.filename, output_filename,
         direct_download, job_id,
         converter_kwargs={"target_size_kb": target_size_kb} if target_size_kb else None,
     )

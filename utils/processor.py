@@ -2,7 +2,8 @@
 Shared processor for all conversion endpoints.
 Handles: sync/async, direct download, batch processing, ZIP bundling, custom filenames.
 """
-import io
+import os
+import tempfile
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -16,15 +17,21 @@ from monitoring import posthog_client
 from monitoring.metrics import (
     log_activity_start, log_batch_activity_start, update_activity_status,
 )
-from utils.storage import upload_to_gcs, upload_rendered_html, generate_presigned_url
+from utils import memory
+from utils.storage import (
+    upload_to_gcs, upload_fileobj_to_gcs, upload_rendered_html,
+    generate_presigned_url,
+)
 from utils.retention import schedule_file_cleanup
 from utils.conversion_jobs import (
     create_conversion_job, update_conversion_job_success, update_conversion_job_failure,
+    JobIdConflict,
 )
 from utils.email_notifier import send_job_completion_email
 from utils.callback_notifier import send_callback_notification
 from utils.subscription import get_project_owner_email
 from utils.sitemap import fetch_sitemap_urls
+from utils.error_capture import error_fields
 
 from services.browser.converters import (
     url_to_pdf as _url_to_pdf,
@@ -37,7 +44,7 @@ from models import PdfOptions
 
 # V2 Phase 0: retain rendered HTML in DO Spaces for 90 days. See the
 # Privacy policy for the public disclosure of this retention window
-# and the X-EnConvert-No-Capture opt-out header.
+# and the X-Enconvert-No-Capture opt-out header.
 RENDERED_HTML_RETENTION_HOURS = 90 * 24
 
 import logging
@@ -238,7 +245,7 @@ async def process_single_async(
     Sends email notification and optional customer callback when complete.
 
     `no_capture` skips the V2 Phase 0 rendered-HTML capture for callers
-    that sent `X-EnConvert-No-Capture: true`. Counters are still skipped
+    that sent `X-Enconvert-No-Capture: true`. Counters are still skipped
     because instrumentation is not created in that path.
     """
     url = request_data.get("url", "")
@@ -294,7 +301,8 @@ async def process_single_async(
                 instrumentation, activity_id, user["id"],
             )
             await update_activity_status(
-                activity_id, "Failed", duration=duration, **instr_updates,
+                activity_id, "Failed", duration=duration,
+                **instr_updates, **error_fields(e),
             )
         except Exception:
             pass
@@ -343,82 +351,104 @@ async def process_batch_async(
     converter calls in the batch.
     """
     files, results = [], []
+    # Activity ids that already recorded their OWN per-URL failure cause. A
+    # later batch-level abort must not overwrite that with the generic
+    # "batch aborted" text — the specific root cause is the whole point.
+    causes_recorded: set[int] = set()
     job_status = "failed"
     zip_key = None
     zip_filename = None
     zip_size = None
+    total_output_size = 0
 
+    # Spool the archive to disk as each URL completes (2026-07-28 memory
+    # incident): previously every output's full bytes sat in `files` for the
+    # whole batch, then the ZIP was built in a BytesIO AND doubled via
+    # getvalue() for upload — ~3x a large batch resident on the 1GB droplet.
+    # Disk IO is negligible next to the 10-30s browser renders.
+    spool = tempfile.NamedTemporaryFile(
+        prefix="batch_zip_", suffix=".zip", delete=False
+    )
     try:
-        for i, url in enumerate(urls):
-            aid = activity_ids[i]
-            start = datetime.now(timezone.utc)
-            _capture_url_event(
-                user, "conversion_requested", endpoint,
-                input_size=len(url), is_async=True, is_batch=True,
-            )
-            instrumentation = None if no_capture else PageInstrumentation()
-            try:
-                output_bytes = await call_backend(
-                    endpoint, {**request_data, "url": url},
-                    instrumentation=instrumentation,
-                )
-                duration = (datetime.now(timezone.utc) - start).total_seconds()
-                filename = make_filename(None, url, ext)
-                files.append((filename, output_bytes, aid, len(output_bytes)))
-                results.append({"url": url, "status": "success", "filename": filename})
-                # Mark individual row as Success (url will be updated after ZIP).
-                # Persist V2 Phase 0 instrumentation for THIS url here so we
-                # don't clobber other rows' html keys later in the loop.
-                instr_updates = await _persist_instrumentation(
-                    instrumentation, aid, user["id"],
-                )
-                await update_activity_status(
-                    aid, "Success",
-                    output_file_size=len(output_bytes), duration=duration,
-                    **instr_updates,
-                )
+        with zipfile.ZipFile(spool, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i, url in enumerate(urls):
+                aid = activity_ids[i]
+                start = datetime.now(timezone.utc)
                 _capture_url_event(
-                    user, "conversion_completed", endpoint,
+                    user, "conversion_requested", endpoint,
                     input_size=len(url), is_async=True, is_batch=True,
-                    duration=duration, output_size=len(output_bytes),
                 )
-            except Exception as e:
-                duration = (datetime.now(timezone.utc) - start).total_seconds()
-                results.append({"url": url, "status": "failed", "error": str(e)})
-                _capture_url_event(
-                    user, "conversion_failed", endpoint,
-                    input_size=len(url), is_async=True, is_batch=True,
-                    duration=duration, error_type=type(e).__name__, error_code=500,
-                )
+                instrumentation = None if no_capture else PageInstrumentation()
                 try:
+                    output_bytes = await call_backend(
+                        endpoint, {**request_data, "url": url},
+                        instrumentation=instrumentation,
+                    )
+                    duration = (datetime.now(timezone.utc) - start).total_seconds()
+                    filename = make_filename(None, url, ext)
+                    output_size = len(output_bytes)
+                    zf.writestr(filename, output_bytes)
+                    # The archive member is the only copy now — keep just
+                    # metadata so one conversion's bytes are resident at most.
+                    del output_bytes
+                    total_output_size += output_size
+                    files.append((filename, aid, output_size))
+                    results.append({"url": url, "status": "success", "filename": filename})
+                    # Mark individual row as Success (url will be updated after ZIP).
+                    # Persist V2 Phase 0 instrumentation for THIS url here so we
+                    # don't clobber other rows' html keys later in the loop.
                     instr_updates = await _persist_instrumentation(
                         instrumentation, aid, user["id"],
                     )
                     await update_activity_status(
-                        aid, "Failed", duration=duration, **instr_updates,
+                        aid, "Success",
+                        output_file_size=output_size, duration=duration,
+                        **instr_updates,
                     )
-                except Exception:
-                    pass
+                    _capture_url_event(
+                        user, "conversion_completed", endpoint,
+                        input_size=len(url), is_async=True, is_batch=True,
+                        duration=duration, output_size=output_size,
+                    )
+                except Exception as e:
+                    duration = (datetime.now(timezone.utc) - start).total_seconds()
+                    results.append({"url": url, "status": "failed", "error": str(e)})
+                    _capture_url_event(
+                        user, "conversion_failed", endpoint,
+                        input_size=len(url), is_async=True, is_batch=True,
+                        duration=duration, error_type=type(e).__name__, error_code=500,
+                    )
+                    try:
+                        instr_updates = await _persist_instrumentation(
+                            instrumentation, aid, user["id"],
+                        )
+                        await update_activity_status(
+                            aid, "Failed", duration=duration,
+                            **instr_updates,
+                            **error_fields(e, context=f"url={url}"),
+                        )
+                        causes_recorded.add(aid)
+                    except Exception:
+                        pass
 
         if files:
-            # Create ZIP from successful files
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for name, data, _, _ in files:
-                    zf.writestr(name, data)
-
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S%f")[:-3]
             zip_name = f"{custom_filename}_{ts}.zip" if custom_filename else f"batch_{ts}.zip"
             if custom_filename and custom_filename.lower().endswith('.zip'):
                 zip_name = f"{custom_filename[:-4]}_{ts}.zip"
 
-            result = upload_to_gcs(buf.getvalue(), user["id"], endpoint, zip_name)
+            # Stream the finished archive from disk — never load it whole.
+            spool.seek(0)
+            result = upload_fileobj_to_gcs(
+                spool, user["id"], endpoint, zip_name,
+                file_size=os.path.getsize(spool.name),
+            )
             zip_key = result["object_key"]
             zip_filename = result["filename"]
             zip_size = result["file_size"]
 
             # Set the ZIP key on all successful rows
-            for _, _, aid, _ in files:
+            for _, aid, _ in files:
                 await update_activity_status(
                     aid, "Success", object_key=zip_key,
                 )
@@ -428,13 +458,32 @@ async def process_batch_async(
                 job_status = "success"
 
     except Exception as e:
-        # Mark any remaining In Progress rows as Failed
+        # Mark any remaining In Progress rows as Failed. These rows never
+        # raised individually — the whole batch aborted (ZIP build/upload
+        # or similar), so the recorded detail must say that explicitly
+        # rather than reading like a per-URL conversion failure.
         for i, url in enumerate(urls):
             try:
-                await update_activity_status(activity_ids[i], "Failed")
+                detail = (
+                    {} if activity_ids[i] in causes_recorded
+                    else error_fields(e, context=f"batch aborted; url={url}")
+                )
+                await update_activity_status(
+                    activity_ids[i], "Failed", **detail,
+                )
             except Exception:
                 pass
         logger.error(f"Batch conversion failed: {e}")
+    finally:
+        spool.close()
+        try:
+            os.unlink(spool.name)
+        except OSError:
+            pass
+
+    # Hand the batch's freed heap back to the kernel (glibc retains it
+    # otherwise); fire-and-forget, gated + throttled inside memory.
+    memory.schedule_release(total_output_size, reason="batch")
 
     succeeded = sum(1 for r in results if r.get("status") == "success")
     posthog_client.capture(
@@ -641,7 +690,7 @@ async def handle_url_conversion(
     job_id = data.get("job_id")
 
     # V2 Phase 0 opt-out: consumers can disable rendered-HTML capture
-    # per-request with `X-EnConvert-No-Capture: true`. The Privacy policy
+    # per-request with `X-Enconvert-No-Capture: true`. The Privacy policy
     # documents this header alongside the 90-day retention window.
     no_capture = header_opts_out(request.headers)
 
@@ -798,17 +847,24 @@ async def handle_url_conversion(
         input_size=len(url), is_async=False, is_batch=False, request=request,
     )
 
-    # Create conversion job row (enables polling on timeout)
+    # Create conversion job row (enables polling on timeout). The id is
+    # client-supplied and idempotent: re-claiming your own is fine, claiming
+    # another project's is a 409 rather than a silent clobber.
     if job_id:
-        create_conversion_job(job_id, str(user["id"]))
+        try:
+            create_conversion_job(job_id, str(user["id"]))
+        except JobIdConflict:
+            raise HTTPException(409, "job_id already in use")
 
     start = datetime.now(timezone.utc)
     instrumentation = None if no_capture else PageInstrumentation()
+    output_size = 0  # set once the render succeeds; drives the release hook
 
     try:
         output_bytes = await call_backend(
             endpoint, {**data, "url": url}, instrumentation=instrumentation,
         )
+        output_size = len(output_bytes)
         filename = make_filename(output_filename, url, ext)
         result = upload_to_gcs(output_bytes, user["id"], endpoint, filename)
         duration = (datetime.now(timezone.utc) - start).total_seconds()
@@ -841,7 +897,8 @@ async def handle_url_conversion(
                 instrumentation, activity_id, user["id"],
             )
             await update_activity_status(
-                activity_id, "Failed", duration=duration, **instr_updates,
+                activity_id, "Failed", duration=duration,
+                **instr_updates, **error_fields(exc),
             )
         except Exception:
             pass
@@ -854,8 +911,13 @@ async def handle_url_conversion(
         )
         # Update conversion job on failure
         if job_id:
-            update_conversion_job_failure(job_id, str(exc))
+            update_conversion_job_failure(job_id, str(user["id"]), str(exc))
         raise
+    finally:
+        # Browser renders emit multi-MB PDFs/PNGs whose freed heap glibc
+        # retains; the release runs ~1s later, after this frame (and its
+        # output_bytes reference) has exited. No-ops for small payloads.
+        memory.schedule_release(output_size, reason="url-conversion")
 
     if direct_download:
         if is_browser_key:

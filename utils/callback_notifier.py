@@ -7,8 +7,8 @@ Two delivery surfaces live here:
 * ``send_callback_notification`` — the original V1 async-conversion callback
   (``utils/processor.py``). Unsigned, unchanged, frozen public behavior.
 * HMAC-signed V2 delivery (Task H.8) — ``sign_payload`` / ``verify_signature``
-  / ``deliver_signed_webhook`` plus the ``X-EnConvert-Signature`` /
-  ``X-EnConvert-Timestamp`` header pair. Used by ``/v2/ingest`` completion
+  / ``deliver_signed_webhook`` plus the ``X-Enconvert-Signature`` /
+  ``X-Enconvert-Timestamp`` header pair. Used by ``/v2/ingest`` completion
   (and, from Sprint I.4, ``/v2/watch``). The timestamp is bound INTO the MAC,
   so a replayed delivery can be rejected by a consumer that enforces a freshness
   window.
@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 # ── HMAC webhook signing (Task H.8) ──────────────────────────────────────────
 
 #: Header carrying the hex HMAC, prefixed with the scheme: ``sha256=<hex>``.
-SIGNATURE_HEADER = "X-EnConvert-Signature"
+SIGNATURE_HEADER = "X-Enconvert-Signature"
 #: Header carrying the unix-seconds timestamp that is bound into the MAC.
-TIMESTAMP_HEADER = "X-EnConvert-Timestamp"
+TIMESTAMP_HEADER = "X-Enconvert-Timestamp"
 #: Scheme label prefixing the signature value (future-proofs the algorithm).
 SIGNATURE_SCHEME = "sha256"
 #: Default consumer freshness window — a timestamp older/newer than this many
@@ -61,7 +61,7 @@ def _signed_payload(timestamp: str, body: bytes) -> bytes:
     """Canonical signing input: ``<timestamp>.<raw body>``.
 
     Binding the timestamp into the MAC (Stripe's scheme) is what makes the
-    separate ``X-EnConvert-Timestamp`` header tamper-evident — a consumer that
+    separate ``X-Enconvert-Timestamp`` header tamper-evident — a consumer that
     rejects stale timestamps gets replay protection for free, because an
     attacker cannot move the timestamp without invalidating the signature.
     """

@@ -1,9 +1,0 @@
-F3-STATIC-ABOUT-SENTINEL
-Home
- About
- Pricing
-About page of the deterministic static fixture. Three paragraphs of fixed prose follow so the extracted PDF text has enough volume for a meaningful similarity comparison.
-The render path must not alter content: what discovery found is what the converter renders, one URL at a time, through one browser.
-Second paragraph: the page-quality chain handles cookie banners, sticky headers, lazy-loading scroll, and viewport normalization before the PDF is produced at the tail of the navigation hook.
-Third paragraph: nothing on this page changes between runs, which makes any drift in the extracted text a render regression by definition.
-F3 fixture footer - about page

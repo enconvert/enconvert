@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import io
 
-from .common import guard_zip_bomb, join_blocks, rows_to_markdown_table
+from .common import MAX_TABLE_ROWS, guard_zip_bomb, join_blocks, rows_to_markdown_table
 from .html_md import html_to_markdown
 
 
@@ -112,8 +112,14 @@ def xlsx_to_markdown(file_bytes: bytes) -> str:
     import pandas as pd
 
     guard_zip_bomb(file_bytes)
+    # nrows: rows past MAX_TABLE_ROWS are discarded by rows_to_markdown_table
+    # anyway, so don't parse them; +1 keeps its "(table truncated)" note firing.
     sheets = pd.read_excel(
-        io.BytesIO(file_bytes), sheet_name=None, engine="openpyxl", dtype=str
+        io.BytesIO(file_bytes),
+        sheet_name=None,
+        engine="openpyxl",
+        dtype=str,
+        nrows=MAX_TABLE_ROWS + 1,
     )
     blocks: list[str] = []
     for name, frame in sheets.items():
@@ -122,7 +128,9 @@ def xlsx_to_markdown(file_bytes: bytes) -> str:
         if frame.empty:
             blocks.append("_(empty sheet)_")
             continue
-        rows = [list(frame.columns)] + frame.values.tolist()
+        # itertuples streams rows without materialising the whole sheet as one
+        # numpy object array (frame.values) — a second full-sheet copy.
+        rows = [list(frame.columns), *frame.itertuples(index=False, name=None)]
         table = rows_to_markdown_table(rows)
         blocks.append(table or "_(empty sheet)_")
 
@@ -140,12 +148,16 @@ def csv_to_markdown(file_bytes: bytes) -> str:
 
     text = decode_text_bytes(file_bytes)
     try:
-        frame = pd.read_csv(io.StringIO(text), dtype=str).fillna("")
+        # nrows/itertuples: same bounded-parse + no-full-copy rationale as
+        # xlsx_to_markdown above.
+        frame = pd.read_csv(
+            io.StringIO(text), dtype=str, nrows=MAX_TABLE_ROWS + 1
+        ).fillna("")
     except Exception as exc:  # noqa: BLE001 — surface a clean 400
         raise ValueError(f"Could not parse the CSV file: {exc}")
     if frame.empty:
         raise ValueError("The CSV file contains no rows.")
-    rows = [list(frame.columns)] + frame.values.tolist()
+    rows = [list(frame.columns), *frame.itertuples(index=False, name=None)]
     table = rows_to_markdown_table(rows)
     if not table:
         raise ValueError("The CSV file contains no rows.")

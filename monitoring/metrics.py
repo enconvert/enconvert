@@ -4,6 +4,7 @@ from sqlalchemy import update as sa_update
 from sqlmodel import select
 from models import Activity, Project, Alert
 from utils.postgres import get_db
+from utils.error_capture import MAX_ERROR_TYPE_CHARS, truncate_error
 from utils.subscription import increment_conversion_usage, update_storage_peak, is_admin_default_project
 
 
@@ -90,6 +91,8 @@ async def update_activity_status(
     rendered_html_key: str | None = None,
     console_error_count: int | None = None,
     page_load_time_ms: int | None = None,
+    error_message: str | None = None,
+    error_type: str | None = None,
     count_usage: bool = True,
 ):
     """Update an existing activity row. Only overwrites fields with non-default values.
@@ -97,6 +100,13 @@ async def update_activity_status(
     The four instrumentation kwargs (V2 Phase 0) follow the same rule:
     pass them only when you actually have a value, so a partial update
     from the conversion path doesn't clobber another writer's data.
+
+    ``error_message`` / ``error_type`` (migration 025) record WHY a
+    conversion failed, so the admin Activity table shows the root cause
+    without anyone reading the droplet's journal. Pass them on every
+    Failed transition — ``utils.error_capture.error_fields(exc)`` builds
+    both. A Success transition clears them: a stale traceback on a row
+    that ended up succeeding is worse than no traceback at all.
 
     ``count_usage=False`` (Sprint F.5) records the activity WITHOUT the
     V1 usage side effects (conversions_used increment, storage counter,
@@ -127,6 +137,15 @@ async def update_activity_status(
         activity.console_error_count = console_error_count
     if page_load_time_ms is not None:
         activity.page_load_time_ms = page_load_time_ms
+    if error_message is not None:
+        activity.error_message = truncate_error(error_message)
+    if error_type is not None:
+        activity.error_type = error_type[:MAX_ERROR_TYPE_CHARS]
+    if status == "Success":
+        # The row ended up succeeding — drop any detail from an earlier
+        # failed attempt so the admin table never shows a stale cause.
+        activity.error_message = None
+        activity.error_type = None
     db.add(activity)
     db.commit()
 

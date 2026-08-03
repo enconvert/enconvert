@@ -161,12 +161,24 @@ def pdf_to_markdown(file_bytes: bytes) -> str:
 
         # ── Pass 1: collect font sizes + per-page (lines, tables) ────────────
         size_counts: Counter[int] = Counter()
-        pages_content: list[tuple[list[dict], list[Any]]] = []
+        pages_content: list[tuple[list[dict], list[tuple[Any, Any]]]] = []
         page_text_sets: list[set[str]] = []
 
         for page in pdf.pages:
             tables = _safe_find_tables(page)
             table_bboxes = [t.bbox for t in tables]
+            # Materialize (bbox, rows) NOW instead of keeping Table objects:
+            # a live Table pins its Page (and the page's char/word caches) for
+            # the whole document — multi-GB on large PDFs. extract() was paid
+            # in pass 2 anyway, so this is zero net CPU. rows=None marks a
+            # failed extract so pass 2 still breaks the paragraph there.
+            table_data: list[tuple[Any, Any]] = []
+            for t in tables:
+                try:
+                    table_data.append((t.bbox, t.extract()))
+                except Exception:  # noqa: BLE001 — skip an unreadable table
+                    logger.debug("pdf table extraction failed", exc_info=True)
+                    table_data.append((t.bbox, None))
             words = page.extract_words(extra_attrs=["size"], use_text_flow=True)
             if len(words) > _MAX_WORDS_PER_PAGE:
                 words = words[:_MAX_WORDS_PER_PAGE]
@@ -174,8 +186,11 @@ def pdf_to_markdown(file_bytes: bytes) -> str:
             for word in prose_words:
                 size_counts[round(word.get("size", 0.0))] += 1
             lines = _group_words_into_lines(prose_words)
-            pages_content.append((lines, tables))
+            pages_content.append((lines, table_data))
             page_text_sets.append({ln["text"] for ln in lines})
+            # Everything pass 2 needs is now in plain lists — drop this page's
+            # cached chars/words/edges so peak memory stays ~one page.
+            page.flush_cache()
 
         if not size_counts and not any(tables for _, tables in pages_content):
             raise ValueError(
@@ -205,8 +220,8 @@ def pdf_to_markdown(file_bytes: bytes) -> str:
             elements: list[tuple[float, str, Any]] = []
             for line in lines:
                 elements.append((line["top"], "line", line))
-            for table in tables:
-                elements.append((table.bbox[1], "table", table))
+            for bbox, rows in tables:
+                elements.append((bbox[1], "table", rows))
             elements.sort(key=lambda e: e[0])
 
             prev_top: float | None = None  # reset per page (top is page-relative)
@@ -217,9 +232,10 @@ def pdf_to_markdown(file_bytes: bytes) -> str:
                     _flush_para()
                     prev_top = None
                     try:
-                        md = rows_to_markdown_table(obj.extract())
+                        # Rows were materialized in pass 1; None = failed extract.
+                        md = rows_to_markdown_table(obj) if obj is not None else ""
                     except Exception:  # noqa: BLE001 — skip an unreadable table
-                        logger.debug("pdf table extraction failed", exc_info=True)
+                        logger.debug("pdf table rendering failed", exc_info=True)
                         md = ""
                     if md:
                         blocks.append(md)

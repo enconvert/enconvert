@@ -230,7 +230,15 @@ async def run_check(claimed: ClaimedWatcher) -> None:
     only skips one cycle.
     """
     try:
-        page = await perceive_flow.render_html(str(claimed.url))
+        # allow_tls=False: a watch check is a COMPARISON against a stored
+        # baseline, so the capture method must not change underneath it. The
+        # no-browser TLS rung returns raw un-hydrated HTML; letting a watcher
+        # whose baseline was captured by Chromium silently flip to it would
+        # drop text similarity under TEXT_SIMILARITY_THRESHOLD and fire a
+        # change webhook + email for a page that never changed.
+        page = await perceive_flow.render_html(
+            str(claimed.url), allow_tls=False
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — a bad render is a watcher error

@@ -1,50 +1,33 @@
 import markdown
 
-def markdown_to_html(markdown_bytes: bytes) -> bytes:
-    """
-    Convert Markdown to HTML.
-    
-    Args:
-        markdown_bytes: Markdown content as bytes
-        
-    Returns:
-        HTML content as bytes
-        
-    Raises:
-        ValueError: If Markdown is invalid or conversion fails
-    """
-    try:
-        markdown_str = markdown_bytes.decode('utf-8')
-        
-        html_str = markdown.markdown(
-            markdown_str,
-            extensions=['tables', 'fenced_code', 'codehilite', 'toc', 'attr_list']
-        )
-        
-        full_html = f"""<!DOCTYPE html>
+# Static page shell around the converted body, pre-encoded once at import.
+# The previous single f-string wrap materialised a second full-document str
+# plus its encoded copy on every request; now only the converted body is
+# encoded per request and joined with these constants.
+_HTML_HEAD: bytes = """<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Converted Document</title>
     <style>
-        :root {{
+        :root {
             --bg-color: #ffffff;
             --text-color: #333333;
             --code-bg: #f4f4f4;
             --border-color: #ddd;
             --th-bg: #f4f4f4;
-        }}
+        }
 
-        [data-theme="dark"] {{
+        [data-theme="dark"] {
             --bg-color: #1e1e1e;
             --text-color: #e0e0e0;
             --code-bg: #2d2d2d;
             --border-color: #444;
             --th-bg: #2d2d2d;
-        }}
+        }
 
-        body {{
+        body {
             max-width: 800px;
             margin: 40px auto;
             padding: 0 20px;
@@ -53,9 +36,9 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
             background-color: var(--bg-color);
             color: var(--text-color);
             transition: background-color 0.3s ease, color 0.3s ease;
-        }}
+        }
 
-        .theme-toggle {{
+        .theme-toggle {
             position: fixed;
             top: 20px;
             right: 20px;
@@ -69,45 +52,45 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
             color: var(--text-color);
             transition: all 0.3s ease;
             z-index: 1000;
-        }}
+        }
 
-        .theme-toggle:hover {{
+        .theme-toggle:hover {
             opacity: 0.8;
-        }}
+        }
 
-        code {{
+        code {
             background: var(--code-bg);
             padding: 2px 6px;
             border-radius: 3px;
             font-family: 'Courier New', monospace;
-        }}
+        }
 
-        pre {{
+        pre {
             background: var(--code-bg);
             padding: 12px;
             border-radius: 5px;
             overflow-x: auto;
-        }}
+        }
 
-        table {{
+        table {
             border-collapse: collapse;
             width: 100%;
             margin: 20px 0;
-        }}
+        }
 
-        th, td {{
+        th, td {
             border: 1px solid var(--border-color);
             padding: 8px;
             text-align: left;
-        }}
+        }
 
-        th {{
+        th {
             background-color: var(--th-bg);
-        }}
+        }
 
-        a {{
+        a {
             color: var(--text-color);
-        }}
+        }
     </style>
 </head>
 <body>
@@ -115,10 +98,12 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
     <span id="themeIcon">🌙</span> Dark Mode
 </button>
 
-{html_str}
+""".encode('utf-8')
+
+_HTML_TAIL: bytes = """
 
 <script>
-    function toggleTheme() {{
+    function toggleTheme() {
         const html = document.documentElement;
         const currentTheme = html.getAttribute('data-theme');
         const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
@@ -128,17 +113,17 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
         html.setAttribute('data-theme', newTheme);
         localStorage.setItem('theme', newTheme);
 
-        if (newTheme === 'dark') {{
+        if (newTheme === 'dark') {
             themeIcon.textContent = '☀️';
             themeToggle.childNodes[1].textContent = ' Light Mode';
-        }} else {{
+        } else {
             themeIcon.textContent = '🌙';
             themeToggle.childNodes[1].textContent = ' Dark Mode';
-        }}
-    }}
+        }
+    }
 
     // Load saved theme on page load
-    (function() {{
+    (function() {
         const savedTheme = localStorage.getItem('theme') || 'light';
         const html = document.documentElement;
         const themeToggle = document.getElementById('themeToggle');
@@ -146,16 +131,43 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
 
         html.setAttribute('data-theme', savedTheme);
 
-        if (savedTheme === 'dark') {{
+        if (savedTheme === 'dark') {
             themeIcon.textContent = '☀️';
             themeToggle.childNodes[1].textContent = ' Light Mode';
-        }}
-    }})();
+        }
+    })();
 </script>
 </body>
-</html>"""
+</html>""".encode('utf-8')
 
-        return full_html.encode('utf-8')
+
+def markdown_to_html(markdown_bytes: bytes) -> bytes:
+    """
+    Convert Markdown to HTML.
+
+    Args:
+        markdown_bytes: Markdown content as bytes
+
+    Returns:
+        HTML content as bytes
+
+    Raises:
+        ValueError: If Markdown is invalid or conversion fails
+    """
+    try:
+        markdown_str = markdown_bytes.decode('utf-8')
+
+        # 'codehilite' (Pygments) deliberately NOT enabled: the page shell has
+        # no Pygments stylesheet, so its per-token <span>s rendered with no
+        # color while inflating the HTML ~3.6x and peak memory ~6x (see the
+        # measured numbers in markdown_pdf.py, which dropped it for the same
+        # reason on this 1GB box).
+        html_str = markdown.markdown(
+            markdown_str,
+            extensions=['tables', 'fenced_code', 'toc', 'attr_list']
+        )
+
+        return b"".join((_HTML_HEAD, html_str.encode('utf-8'), _HTML_TAIL))
     except UnicodeDecodeError:
         raise ValueError("Invalid Markdown encoding (expected UTF-8)")
     except Exception as e:

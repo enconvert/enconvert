@@ -1,24 +1,24 @@
-import tempfile 
-import os 
-from PIL import Image 
-import pillow_heif
+import os
 
-
-pillow_heif.register_heif_opener()
+from ._limits import ensure_pixel_limit, write_temp_file
 
 
 def heic_to_webp(file_bytes: bytes, original_filename: str) -> bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext not in (".heic", ".heif"):
         raise ValueError("Expected a HEIC file (.heic or .heif)")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_file.write(file_bytes)
-        temp_file_path = temp_file.name
+    temp_file_path = write_temp_file(file_bytes, ext)
 
     output_file_path = os.path.splitext(temp_file_path)[0] + ".webp"
     try:
         image = Image.open(temp_file_path)
+        # Header-only decompression-bomb gate: reject before any decode.
+        ensure_pixel_limit(image)
 
         if image.mode not in ("RGBA", "RGB"):
             image = image.convert("RGB")
@@ -37,17 +37,21 @@ def heic_to_webp(file_bytes: bytes, original_filename: str) -> bytes:
 
 
 def webp_to_heic(file_bytes: bytes, original_filename: str) -> bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext != ".webp":
         raise ValueError("Expected a WebP file (.webp)")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_file.write(file_bytes)
-        temp_file_path = temp_file.name
+    temp_file_path = write_temp_file(file_bytes, ext)
 
     output_file_path = os.path.splitext(temp_file_path)[0] + ".heic"
     try:
         image = Image.open(temp_file_path)
+        # Header-only decompression-bomb gate: reject before any decode.
+        ensure_pixel_limit(image)
 
         if image.mode == "RGBA":
             background = Image.new("RGB", image.size, (255, 255, 255))

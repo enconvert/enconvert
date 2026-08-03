@@ -1,25 +1,30 @@
-import tempfile 
-import os 
-from PIL import Image 
-import cairosvg 
-import pillow_heif
+import os
 
-pillow_heif.register_heif_opener()
+from ._limits import ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
+
 
 def svg_to_heic(file_bytes: bytes, original_filename: str) -> bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    from PIL import Image
+    import cairosvg
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext != ".svg":
         raise ValueError("Expected an SVG file (.svg)")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".svg") as temp_file:
-        temp_file.write(file_bytes)
-        temp_file_path = temp_file.name
+    # This endpoint takes no width/height, so always cap the intrinsic render:
+    # a tiny SVG declaring a huge canvas would otherwise make cairo allocate a
+    # multi-GB surface.
+    size_kwargs = svg_render_cap_kwargs(file_bytes)
+
+    temp_file_path = write_temp_file(file_bytes, ".svg")
 
     png_file_path = os.path.splitext(temp_file_path)[0] + ".png"
     output_file_path = os.path.splitext(temp_file_path)[0] + ".heic"
     try:
         # Step 1: SVG → PNG using cairosvg
-        cairosvg.svg2png(url=temp_file_path, write_to=png_file_path)
+        cairosvg.svg2png(url=temp_file_path, write_to=png_file_path, **size_kwargs)
 
         # Step 2: PNG → HEIC using PIL + pillow_heif
         with Image.open(png_file_path) as image:
@@ -46,17 +51,20 @@ def svg_to_heic(file_bytes: bytes, original_filename: str) -> bytes:
 
 
 def heic_to_svg(file_bytes: bytes, original_filename: str) -> bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext not in (".heic", ".heif"):
         raise ValueError("Expected a HEIC file (.heic or .heif)")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_file.write(file_bytes)
-        temp_file_path = temp_file.name
+    temp_file_path = write_temp_file(file_bytes, ext)
 
-    output_file_path = os.path.splitext(temp_file_path)[0] + ".svg"
     try:
         with Image.open(temp_file_path) as image:
+            # Header-only decompression-bomb gate: reject before any decode.
+            ensure_pixel_limit(image)
             width, height = image.size
 
             # Save as PNG bytes for base64 embedding
@@ -65,29 +73,28 @@ def heic_to_svg(file_bytes: bytes, original_filename: str) -> bytes:
             if image.mode not in ("RGBA", "RGB"):
                 image = image.convert("RGB")
             image.save(png_buffer, format="PNG")
-            png_bytes = png_buffer.getvalue()
 
         import base64
-        img_base64 = base64.b64encode(png_bytes).decode("utf-8")
+        # bytes end-to-end: getbuffer() (no getvalue copy) + undecoded base64
+        # joined once avoids the multiple full-size transient copies the
+        # str + f-string assembly materialized. Output bytes are identical.
+        img_b64 = base64.b64encode(png_buffer.getbuffer())
 
-        svg_content = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" '
-            f'width="{width}" height="{height}" '
-            f'viewBox="0 0 {width} {height}">\n'
-            f'  <image href="data:image/png;base64,{img_base64}" '
-            f'width="{width}" height="{height}"/>\n'
-            f'</svg>'
-        )
-
-        with open(output_file_path, "w", encoding="utf-8") as f:
-            f.write(svg_content)
-
-        with open(output_file_path, "rb") as f:
-            return f.read()
+        return b"".join((
+            (
+                f'<svg xmlns="http://www.w3.org/2000/svg" '
+                f'width="{width}" height="{height}" '
+                f'viewBox="0 0 {width} {height}">\n'
+                f'  <image href="data:image/png;base64,'
+            ).encode("ascii"),
+            img_b64,
+            (
+                f'" width="{width}" height="{height}"/>\n'
+                f'</svg>'
+            ).encode("ascii"),
+        ))
     except Exception as e:
         raise ValueError(f"Image conversion failed: {str(e)}")
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-        if os.path.exists(output_file_path):
-            os.remove(output_file_path)

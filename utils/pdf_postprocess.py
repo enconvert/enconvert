@@ -9,6 +9,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on a single Ghostscript run: generous for legitimate PDFs, but
+# without it a pathological input pins CPU/RAM on the 1GB droplet indefinitely.
+_GS_TIMEOUT_SECONDS = 120
+
 
 async def convert_to_grayscale(pdf_bytes: bytes) -> bytes:
     """
@@ -49,7 +53,25 @@ async def convert_to_grayscale(pdf_bytes: bytes) -> bytes:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_GS_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            # Kill + reap: an orphaned gs would otherwise keep running in the
+            # worker's cgroup long after the request is gone.
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(
+                "Ghostscript grayscale conversion timed out "
+                f"after {_GS_TIMEOUT_SECONDS}s"
+            )
+        except asyncio.CancelledError:
+            # Task cancellation (client disconnect / shutdown) does not kill
+            # the child on its own — reap it before propagating.
+            proc.kill()
+            await proc.wait()
+            raise
 
         if proc.returncode != 0:
             error_msg = stderr.decode(errors="replace").strip()

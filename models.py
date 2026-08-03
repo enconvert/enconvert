@@ -226,6 +226,12 @@ class Activity(SQLModel, table=True):
     rendered_html_key: Optional[str] = Field(default=None, max_length=512)
     console_error_count: int = 0
     page_load_time_ms: int = 0
+    # Failure detail (migration 025). Set only on Failed rows: the full
+    # formatted exception chain, written by monitoring.metrics via
+    # utils.error_capture. Admin-only surface — it can contain internal
+    # paths and library internals, so it is never returned to end users.
+    error_message: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    error_type: Optional[str] = Field(default=None, max_length=128, index=True)
 
 
 class ProjectMember(SQLModel, table=True):

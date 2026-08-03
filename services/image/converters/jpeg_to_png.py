@@ -1,19 +1,21 @@
-import tempfile
 import os
-from PIL import Image
+
+from ._limits import ensure_pixel_limit, write_temp_file
 
 
 def convert_image(file_bytes: bytes, ext: str, output_format: str) -> bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     output_ext = f".{output_format}"
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_file.write(file_bytes)
-        temp_file_path = temp_file.name
+    temp_file_path = write_temp_file(file_bytes, ext)
 
     base_path = os.path.splitext(temp_file_path)[0]
     output_file_path = base_path + output_ext
     try:
         image = Image.open(temp_file_path)
+        # Header-only decompression-bomb gate: reject before any decode.
+        ensure_pixel_limit(image)
 
         # JPEG doesn't support transparency — flatten alpha onto white background
         if output_format == "jpeg" and image.mode == "RGBA":

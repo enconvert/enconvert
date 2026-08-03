@@ -52,6 +52,7 @@ from services.v2_engine.chunking.semantic import (
 )
 from utils import webhook_secret
 from utils.callback_notifier import WebhookDeliveryResult
+from utils.error_capture import error_fields
 from utils.retention import schedule_file_cleanup
 from utils.storage import delete_from_storage, sanitize_filename, upload_to_gcs
 from utils.validators import validate_file_content
@@ -117,7 +118,7 @@ async def ingest(
         await _create_and_enqueue(job_id, project_id, body)
     except Exception as exc:
         logger.exception("/v2/ingest submit failed (job %s)", job_id)
-        await _mark_activity(activity_id, "Failed", start)
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise HTTPException(
             status_code=500,
             detail=f"Could not start ingest job. Reference job_id "
@@ -238,14 +239,14 @@ async def ingest_files(
         )
         await asyncio.to_thread(ingest_store.create_file_pages, job_id, uploaded)
         await ingest_worker.submit(job_id)
-    except HTTPException:
+    except HTTPException as exc:
         await _discard_staged(staged)
-        await _mark_activity(activity_id, "Failed", start)
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise
     except Exception as exc:  # noqa: BLE001
         await _discard_staged(staged)
         logger.exception("/v2/ingest/files submit failed (job %s)", job_id)
-        await _mark_activity(activity_id, "Failed", start)
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise HTTPException(
             status_code=500,
             detail=f"Could not start ingest job. Reference job_id '{job_id}' "
@@ -544,7 +545,14 @@ def _retry_detail(result: WebhookDeliveryResult) -> str:
     return f"Delivery failed after {result.attempts} attempt(s)."
 
 
-async def _mark_activity(activity_id: int, status: str, start: datetime) -> None:
+async def _mark_activity(
+    activity_id: int,
+    status: str,
+    start: datetime,
+    *,
+    error: BaseException | None = None,
+    error_context: str | None = None,
+) -> None:
     """Best-effort activity update; never masks the request outcome."""
     duration = (datetime.now(timezone.utc) - start).total_seconds()
     try:
@@ -553,6 +561,7 @@ async def _mark_activity(activity_id: int, status: str, start: datetime) -> None
             status,
             duration=duration,
             count_usage=False,  # coexistence rule 3: V2 never bills V1
+            **error_fields(error, context=error_context),
         )
     except Exception:  # noqa: BLE001
         logger.warning("activity update failed", exc_info=True)

@@ -101,8 +101,19 @@ class TimeoutMiddleware:
         if activity_id is not None:
             try:
                 from monitoring.metrics import update_activity_status
+                from utils.error_capture import error_fields
+                endpoint = getattr(request.state, "endpoint", None) or request.url.path
+                fallback_message = (
+                    f"Request exceeded the {self.timeout:g}s gateway timeout "
+                    f"({endpoint})"
+                )
                 await update_activity_status(
                     activity_id, "Failed", duration=self.timeout,
+                    **error_fields(
+                        None,
+                        fallback_message=fallback_message,
+                        fallback_type="TimeoutError",
+                    ),
                 )
             except Exception:  # noqa: BLE001 — bookkeeping must not mask the 504
                 logger.warning(

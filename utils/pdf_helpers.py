@@ -21,6 +21,7 @@ is fixed by the route). Two copies would drift into two different 400 bodies.
 """
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from services.conversion_errors import UnsupportedOptionError
@@ -172,14 +173,29 @@ def weasyprint_zoom(pdf_options) -> float:
     return pdf_options.scale if pdf_options else 1.0
 
 
-def render_media_pdf(data_uri: str, pdf_options) -> bytes:
-    """Lay a single image/SVG data URI onto a pdf_options-controlled page."""
+def render_media_pdf(
+    media_url: str, pdf_options, allow_file_path: "Optional[str]" = None
+) -> bytes:
+    """Lay a single image/SVG URL (data:, or an allow-listed file://) onto a
+    pdf_options-controlled page.
+
+    ``allow_file_path`` grants the fetcher access to exactly ONE local file —
+    the temp file the caller just wrote — so a large raster can be passed by
+    reference instead of a base64 data URI (which costs ~5 full-image copies
+    across encode, HTML string and WeasyPrint's decode). Everything else,
+    http(s) included, is still refused.
+    """
     from weasyprint import HTML
+
+    allowed_url = Path(allow_file_path).as_uri() if allow_file_path else None
 
     def _data_only_fetcher(url, timeout=10, ssl_context=None):
         # CairoSVG renders with unsafe=False (no external fetches); keep that
         # posture now that the geometry path routes SVG through WeasyPrint,
-        # whose default fetcher would happily resolve http(s) references.
+        # whose default fetcher would happily resolve http(s) references. The
+        # single caller-created temp file is the one exception.
+        if allowed_url is not None and url == allowed_url:
+            return {"file_obj": open(allow_file_path, "rb"), "mime_type": "image/png"}
         raise ValueError(f"External resources are not fetched: {url}")
 
     page_css = build_weasyprint_page_css(pdf_options)
@@ -187,7 +203,7 @@ def render_media_pdf(data_uri: str, pdf_options) -> bytes:
         "<html><head><meta charset='utf-8'>" + page_css +
         "<style>html,body{margin:0;padding:0}"
         "img{max-width:100%;max-height:100%;display:block;margin:auto}</style>"
-        f'</head><body><img src="{data_uri}"></body></html>'
+        f'</head><body><img src="{media_url}"></body></html>'
     )
     return HTML(string=document, url_fetcher=_data_only_fetcher).write_pdf(
         zoom=weasyprint_zoom(pdf_options)

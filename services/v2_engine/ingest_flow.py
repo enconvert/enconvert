@@ -40,8 +40,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import tempfile
 from collections import Counter
-from typing import Any, List, Optional
+from typing import Any, BinaryIO, List, Optional
 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException
@@ -77,10 +79,13 @@ from services.v2_engine.markdown_jsonl import (
     safe_source_label,
 )
 from utils.storage import (
+    DO_SPACES_BUCKET,
     build_object_key,
     delete_from_storage,
     download_from_storage,
     generate_presigned_url,
+    get_s3_client,
+    upload_fileobj_to_gcs,
     upload_to_gcs,
 )
 from utils.subscription import get_effective_subscription
@@ -481,6 +486,26 @@ async def _cleanup_source_files(job_id: str, pages: List[IngestPage]) -> None:
             )
 
 
+def _stream_object_to_file(object_key: str, sink: BinaryIO) -> None:
+    """Stream one Spaces object into ``sink`` in 64KB chunks (blocking).
+
+    Bypasses download_from_storage (whole-object bytes) so assembly never
+    holds a full page in RAM — run via asyncio.to_thread. A failure rolls
+    the partial write back so the spool stays a clean concatenation of
+    complete pages, then re-raises for the caller's per-page handling.
+    """
+    client = get_s3_client()
+    offset = sink.tell()
+    try:
+        body = client.get_object(Bucket=DO_SPACES_BUCKET, Key=object_key)["Body"]
+        for chunk in body.iter_chunks(65536):
+            sink.write(chunk)
+    except Exception:
+        sink.seek(offset)
+        sink.truncate()
+        raise
+
+
 async def _assemble(job: IngestJob, subscription: dict) -> None:
     """Concatenate completed per-page JSONL into the final file, or fail the
     job if nothing completed. Skips when the job was canceled mid-flight."""
@@ -523,49 +548,67 @@ async def _assemble(job: IngestJob, subscription: dict) -> None:
         await _cleanup_source_files(job_id, pages)
         return
 
-    # Download each completed page's staged JSONL. If an object is missing
-    # (it must not be, since complete_page runs only after a successful
-    # upload), demote that page to 'failed' so total_chunks stays consistent
-    # with the bytes actually assembled — never report chunks the final file
-    # does not contain.
-    assembled: List[bytes] = []
-    assembled_chunks = 0
-    missing = 0
-    for page in completed:
-        key = page_object_key(project_id, job_id, page.url)
-        try:
-            assembled.append(await asyncio.to_thread(download_from_storage, key))
-            assembled_chunks += page.chunk_count
-        except Exception:  # noqa: BLE001 — a missing stage object drops one page
-            logger.warning(
-                "ingest %s: staged page object missing (%s)", job_id, _safe(page.url)
-            )
-            await asyncio.to_thread(
-                ingest_store.fail_page, page.id, "staged object missing at assembly"
-            )
-            missing += 1
-
-    if not assembled:
-        await asyncio.to_thread(
-            ingest_store.fail_job,
-            job_id,
-            "all completed pages were lost before assembly",
-        )
-        await _cleanup_source_files(job_id, pages)
-        return
-
-    final_blob = b"".join(assembled)
-    total_chunks = assembled_chunks
-    pages_done = len(completed) - missing
-    pages_failed = len(failed_or_skipped) + missing
-
-    upload = await asyncio.to_thread(
-        upload_to_gcs,
-        final_blob,
-        str(project_id),
-        FINAL_ENDPOINT,
-        _final_filename(job_id),
+    # Stream each completed page's staged JSONL straight into one on-disk
+    # spool (2026-07-28 memory incident): the old path held every page's
+    # bytes in a list, doubled them with b"".join() and kept the blob
+    # resident through the upload — ~3x the final file on the 1GB droplet.
+    # If an object is missing (it must not be, since complete_page runs only
+    # after a successful upload), demote that page to 'failed' so
+    # total_chunks stays consistent with the bytes actually assembled —
+    # never report chunks the final file does not contain.
+    spool = tempfile.NamedTemporaryFile(
+        prefix="ingest_final_", suffix=".jsonl", delete=False
     )
+    try:
+        assembled_pages = 0
+        assembled_chunks = 0
+        missing = 0
+        for page in completed:
+            key = page_object_key(project_id, job_id, page.url)
+            try:
+                await asyncio.to_thread(_stream_object_to_file, key, spool)
+                assembled_pages += 1
+                assembled_chunks += page.chunk_count
+            except Exception:  # noqa: BLE001 — a missing stage object drops one page
+                logger.warning(
+                    "ingest %s: staged page object missing (%s)", job_id, _safe(page.url)
+                )
+                await asyncio.to_thread(
+                    ingest_store.fail_page, page.id, "staged object missing at assembly"
+                )
+                missing += 1
+
+        if not assembled_pages:
+            await asyncio.to_thread(
+                ingest_store.fail_job,
+                job_id,
+                "all completed pages were lost before assembly",
+            )
+            await _cleanup_source_files(job_id, pages)
+            return
+
+        total_chunks = assembled_chunks
+        pages_done = len(completed) - missing
+        pages_failed = len(failed_or_skipped) + missing
+
+        # upload_fileobj_to_gcs derives the key via build_object_key exactly
+        # like upload_to_gcs did — the FINAL_ENDPOINT key shape is unchanged.
+        spool.flush()
+        spool.seek(0)
+        upload = await asyncio.to_thread(
+            upload_fileobj_to_gcs,
+            spool,
+            str(project_id),
+            FINAL_ENDPOINT,
+            _final_filename(job_id),
+            file_size=os.path.getsize(spool.name),
+        )
+    finally:
+        spool.close()
+        try:
+            os.unlink(spool.name)
+        except OSError:
+            pass
     output_key = upload["object_key"]
 
     committed = await asyncio.to_thread(

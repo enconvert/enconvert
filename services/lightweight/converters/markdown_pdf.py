@@ -1,5 +1,4 @@
 import markdown
-from weasyprint import HTML
 from models import PdfOptions
 from utils.pdf_helpers import build_weasyprint_page_css, weasyprint_zoom
 
@@ -17,12 +16,25 @@ def markdown_to_pdf(markdown_bytes: bytes, pdf_options: PdfOptions = None) -> by
     Raises:
         ValueError: If Markdown is invalid or conversion fails
     """
+    # WeasyPrint (Pango/cairo/fontconfig native stack, ~30-40MB) imported
+    # lazily so importing this module at startup keeps it off idle RAM.
+    from weasyprint import HTML
     try:
         markdown_str = markdown_bytes.decode('utf-8')
 
+        # 'codehilite' (Pygments) is deliberately NOT enabled. Without a
+        # matching Pygments stylesheet in the <style> block below, its per-token
+        # <span>s render with NO color anyway — so it produced zero visible
+        # highlighting while inflating the HTML ~3.6x and peak WeasyPrint memory
+        # ~6x. Measured on a 763KB, 128-code-block doc: 1578MB/29s WITH it vs
+        # 252MB/5s WITHOUT. On the 1GB droplet that overhead pushed large
+        # code-heavy docs into swap-thrash and an nginx 504. To bring real
+        # highlighting back, add BOTH this extension AND an injected Pygments CSS
+        # (HtmlFormatter().get_style_defs('.codehilite')), gated by input size
+        # (len(markdown_bytes)) so it stays within the box's memory budget.
         html_str = markdown.markdown(
             markdown_str,
-            extensions=['tables', 'fenced_code', 'codehilite', 'toc', 'attr_list']
+            extensions=['tables', 'fenced_code', 'toc', 'attr_list']
         )
 
         page_css = build_weasyprint_page_css(pdf_options) if pdf_options else ""

@@ -30,6 +30,29 @@ logger = logging.getLogger(__name__)
 # restart and is resumed — mirrors the migration's partial-index predicate).
 ACTIVE_BATCH_STATUSES = ("queued", "processing")
 
+# PerceiveOptions keys that carry caller secrets (basic-auth credentials,
+# session cookies, Authorization headers). The envelope's ``options`` block is
+# persisted to JSONB so a restart can rebuild each PerceiveRequest — but these
+# must never sit at rest in the database, where they would outlive the request
+# and be readable by anyone with DB access or a backup.
+_SECRET_OPTION_KEYS = ("auth", "cookies", "headers")
+
+
+def _redact(options: dict[str, Any]) -> dict[str, Any]:
+    """Strip caller credentials from the envelope before it is persisted.
+
+    Sets ``_redacted`` to the list of dropped keys so the resume path can tell
+    "the caller sent no credentials" apart from "we dropped them", and fail the
+    batch instead of silently re-rendering it unauthenticated (which would
+    return login walls to a caller who paid for authenticated renders).
+    """
+    dropped = [k for k in _SECRET_OPTION_KEYS if options.get(k)]
+    if not dropped:
+        return options
+    safe = {k: v for k, v in options.items() if k not in _SECRET_OPTION_KEYS}
+    safe["_redacted"] = dropped
+    return safe
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -52,7 +75,7 @@ def create_batch(
                 project_id=project_id,
                 status="queued",
                 output_mode=output_mode,
-                options=options,
+                options=_redact(options),
                 total=total,
                 created_at=_utcnow(),
             )

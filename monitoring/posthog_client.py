@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
@@ -87,6 +88,12 @@ def init() -> Any:
                 project_api_key=key,
                 host=host,
                 enable_exception_autocapture=True,
+                # SDK default is 10,000 buffered events (~10-40MB when egress
+                # stalls — e.g. the 2026-07-16 Cloudflare-block incident
+                # class). On the 1GB droplet cap the queue; overflow is
+                # drop-on-full inside the SDK, so a stall costs analytics,
+                # never memory.
+                max_queue_size=int(os.getenv("POSTHOG_MAX_QUEUE_SIZE", "1000")),
             )
         except TypeError:
             # Older SDK without the autocapture kwarg — keep analytics rather
@@ -304,11 +311,29 @@ def _request_context() -> Iterator[None]:
     if factory is None:
         yield
         return
+    # Only ENTERING the context is best-effort. The body must never sit inside
+    # an `except` that yields again: contextlib calls gen.throw() when the body
+    # raises, and a second yield there makes it raise
+    # `RuntimeError: generator didn't stop after throw()`, destroying the real
+    # traceback. This is the outermost middleware, so that bug replaced EVERY
+    # unhandled request exception with that RuntimeError.
     try:
-        with factory():
-            yield
+        cm = factory()
+        cm.__enter__()
     except Exception:  # noqa: BLE001 — contexts are a best-effort convenience
         yield
+        return
+    try:
+        yield
+    finally:
+        # sys.exc_info() reports whatever is propagating (including
+        # BaseException/CancelledError on client disconnect). The return value
+        # is intentionally ignored: a PostHog context must never SUPPRESS a
+        # request exception.
+        try:
+            cm.__exit__(*sys.exc_info())
+        except Exception:  # noqa: BLE001
+            logger.debug("PostHog context exit failed", exc_info=True)
 
 
 def identify_context(distinct_id: str) -> None:

@@ -6,7 +6,7 @@ import os
 import re
 import boto3
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, BinaryIO, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,46 @@ DO_SPACES_ENDPOINT = os.getenv("DO_SPACES_ENDPOINT", "").strip()
 
 # Environment prefix: "live" for production, "dev" for development
 ENV_PREFIX = "live" if os.getenv("ENVIRONMENT") == "production" else "dev"
+
+# Content type by extension — module-level so the whole-bytes and streaming
+# upload helpers derive identical metadata for the same filename.
+CONTENT_TYPES: Dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".xml": "application/xml",
+    ".json": "application/json",
+    ".html": "text/html",
+    ".yaml": "application/x-yaml",
+    ".yml": "application/x-yaml",
+    ".zip": "application/zip",
+    ".jsonl": "application/x-ndjson",
+    ".ndjson": "application/x-ndjson",
+}
+
+# Process-wide S3 client (2026-07-28 memory incident): a fresh boto3 client
+# per storage call allocated a new botocore event system + endpoint resolver
+# + urllib3 pool every time (~1MB churn per call, plus a TLS handshake). In
+# the days-long gateway process that steady churn feeds glibc arena
+# fragmentation — freed blocks stay pinned — and it is also simply slower.
+# boto3 clients are documented thread-safe, so one shared instance serves
+# every helper here and the asyncio.to_thread callers alike.
+_s3_client = None
+
+
+def get_s3_client():
+    """Return the shared boto3 S3 client for DO Spaces (built lazily)."""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client(
+            "s3",
+            region_name=DO_SPACES_REGION,
+            endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
+            aws_access_key_id=DO_SPACES_KEY,
+            aws_secret_access_key=DO_SPACES_SECRET,
+        )
+    return _s3_client
 
 
 def extract_filename_from_header(content_disposition: str) -> str:
@@ -76,35 +116,14 @@ def upload_to_gcs(
 
     Returns dict with: file_url, file_size, filename
     """
-    # Initialize S3 client for DO Spaces
-    client = boto3.client(
-        's3',
-        region_name=DO_SPACES_REGION,
-        endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
-        aws_access_key_id=DO_SPACES_KEY,
-        aws_secret_access_key=DO_SPACES_SECRET
-    )
+    client = get_s3_client()
 
     sanitized_filename = sanitize_filename(original_filename)
     object_key = build_object_key(user_id, endpoint, original_filename)
 
     # Content type mapping
     ext = Path(sanitized_filename).suffix.lower()
-    content_types = {
-        ".pdf": "application/pdf",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".xml": "application/xml",
-        ".json": "application/json",
-        ".html": "text/html",
-        ".yaml": "application/x-yaml",
-        ".yml": "application/x-yaml",
-        ".zip": "application/zip",
-        ".jsonl": "application/x-ndjson",
-        ".ndjson": "application/x-ndjson",
-    }
-    content_type = content_types.get(ext, "application/octet-stream")
+    content_type = CONTENT_TYPES.get(ext, "application/octet-stream")
 
     # Upload to DO Spaces (private by default - no ACL specified)
     client.put_object(
@@ -121,6 +140,45 @@ def upload_to_gcs(
     }
 
 
+def upload_fileobj_to_gcs(
+    fileobj: BinaryIO,
+    user_id: str,
+    endpoint: str,
+    original_filename: str,
+    *,
+    file_size: int,
+) -> Dict[str, Any]:
+    """Streaming twin of ``upload_to_gcs`` for disk-spooled payloads.
+
+    Same key derivation and content-type mapping, but the body goes through
+    boto3's ``upload_fileobj`` (chunked under the hood) so the payload is
+    never materialized as one bytes object — on the 1GB droplet that
+    whole-blob copy is what pushed large batch ZIPs into swap. ``file_size``
+    is caller-supplied (a stream has no length) purely to preserve the
+    upload_to_gcs return shape.
+    """
+    client = get_s3_client()
+
+    sanitized_filename = sanitize_filename(original_filename)
+    object_key = build_object_key(user_id, endpoint, original_filename)
+
+    ext = Path(sanitized_filename).suffix.lower()
+    content_type = CONTENT_TYPES.get(ext, "application/octet-stream")
+
+    client.upload_fileobj(
+        fileobj,
+        DO_SPACES_BUCKET,
+        object_key,
+        ExtraArgs={"ContentType": content_type},
+    )
+
+    return {
+        "object_key": object_key,
+        "file_size": file_size,
+        "filename": sanitized_filename,
+    }
+
+
 def upload_rendered_html(html: str, project_id: str, job_id: str) -> str:
     """Upload the post-render HTML for a Playwright conversion to DO Spaces.
 
@@ -133,13 +191,7 @@ def upload_rendered_html(html: str, project_id: str, job_id: str) -> str:
     if not html:
         raise ValueError("upload_rendered_html called with empty html")
 
-    client = boto3.client(
-        "s3",
-        region_name=DO_SPACES_REGION,
-        endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
-        aws_access_key_id=DO_SPACES_KEY,
-        aws_secret_access_key=DO_SPACES_SECRET,
-    )
+    client = get_s3_client()
 
     safe_project = sanitize_filename(str(project_id))
     safe_job = sanitize_filename(str(job_id))
@@ -162,13 +214,7 @@ def download_from_storage(object_key: str) -> bytes:
     archive. Raises on a missing key — the caller decides whether a
     partial ZIP is acceptable.
     """
-    client = boto3.client(
-        "s3",
-        region_name=DO_SPACES_REGION,
-        endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
-        aws_access_key_id=DO_SPACES_KEY,
-        aws_secret_access_key=DO_SPACES_SECRET,
-    )
+    client = get_s3_client()
     response = client.get_object(Bucket=DO_SPACES_BUCKET, Key=object_key)
     return response["Body"].read()
 
@@ -176,13 +222,7 @@ def download_from_storage(object_key: str) -> bytes:
 def delete_from_storage(object_key: str):
     """Delete a file from DigitalOcean Spaces."""
     try:
-        client = boto3.client(
-            's3',
-            region_name=DO_SPACES_REGION,
-            endpoint_url=f"https://{DO_SPACES_REGION}.digitaloceanspaces.com",
-            aws_access_key_id=DO_SPACES_KEY,
-            aws_secret_access_key=DO_SPACES_SECRET
-        )
+        client = get_s3_client()
         client.delete_object(Bucket=DO_SPACES_BUCKET, Key=object_key)
     except Exception as e:
         logger.error("Failed to delete %s: %s", object_key, e)

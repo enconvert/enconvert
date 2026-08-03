@@ -1,6 +1,6 @@
 import json
 import csv
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
 
 def csv_to_json(csv_bytes: bytes) -> bytes:
     """
@@ -24,9 +24,14 @@ def csv_to_json(csv_bytes: bytes) -> bytes:
         if not data:
             raise ValueError("CSV file is empty or has no valid rows")
         
-        json_str = json.dumps(data, indent=2, ensure_ascii=False)
-        
-        return json_str.encode('utf-8')
+        # Stream JSON straight into UTF-8 bytes: dumps() + .encode() held two
+        # full copies of the output at peak. newline='' keeps bytes identical.
+        buf = BytesIO()
+        wrapper = TextIOWrapper(buf, encoding='utf-8', newline='')
+        json.dump(data, wrapper, indent=2, ensure_ascii=False)
+        wrapper.flush()
+
+        return buf.getvalue()
     except UnicodeDecodeError:
         raise ValueError("Invalid CSV encoding (expected UTF-8)")
     except Exception as e:

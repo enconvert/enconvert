@@ -28,6 +28,7 @@ from api.v2.schemas.distill import DistillRequest, DistillResponse
 from monitoring import posthog_client
 from monitoring.metrics import log_activity_start, update_activity_status
 from services.v2_engine import distill_flow
+from utils.error_capture import error_fields
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +75,8 @@ async def distill(
 
     try:
         response = await distill_flow.run(body, operation_id, user)
-    except HTTPException:
-        await _mark_activity(activity_id, "Failed", start)
+    except HTTPException as exc:
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise
     except Exception as exc:
         # Full detail to server logs only; the client gets a generic
@@ -83,7 +84,7 @@ async def distill(
         # exception text can leak internal paths / library internals
         # (Playwright, SQLAlchemy, etc.) — never echo it.
         logger.exception("/v2/distill failed (operation %s)", operation_id)
-        await _mark_activity(activity_id, "Failed", start)
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise HTTPException(
             status_code=500,
             detail=f"Distillation failed. Reference operation_id "
@@ -110,6 +111,8 @@ async def _mark_activity(
     start: datetime,
     *,
     output_file_size: int = 0,
+    error: BaseException | None = None,
+    error_context: str | None = None,
 ) -> None:
     """Best-effort activity update; never masks the request outcome."""
     duration = (datetime.now(timezone.utc) - start).total_seconds()
@@ -120,6 +123,7 @@ async def _mark_activity(
             output_file_size=output_file_size,
             duration=duration,
             count_usage=False,  # coexistence rule 3: V2 never bills V1
+            **error_fields(error, context=error_context),
         )
     except Exception:  # noqa: BLE001
         logger.warning("activity update failed", exc_info=True)

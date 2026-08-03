@@ -34,14 +34,15 @@ with zipfile, uploaded, and the key stamped on the completed operation rows
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
+import os
 import re
+import tempfile
 import uuid
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import IO, Optional
 
 from api.v2.schemas.perceive import (
     OutputArtifact,
@@ -49,13 +50,16 @@ from api.v2.schemas.perceive import (
     PerceiveRequest,
     PerceiveResponse,
 )
+from models import PerceiveOperation
 from monitoring.metrics import log_batch_activity_start, update_activity_status
 from services.v2_engine import batch_store, operations, perceive_flow
 from services.v2_engine.url_safety import assert_public_http_url
+from utils.error_capture import error_fields
 from utils.storage import (
-    download_from_storage,
+    DO_SPACES_BUCKET,
     generate_presigned_url,
-    upload_to_gcs,
+    get_s3_client,
+    upload_fileobj_to_gcs,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,12 +134,11 @@ def make_job(
     batch_id = f"batch_{uuid.uuid4().hex}"
     entries = [(f"per_{uuid.uuid4().hex}", request) for request in requests]
     project_id = int(user["id"])
-    operations.create_queued_operations(
-        batch_id=batch_id,
-        project_id=project_id,
-        entries=[(op_id, str(request.url)) for op_id, request in entries],
-        outputs_requested=list(dict.fromkeys(body.options.outputs)),
-    )
+    # Envelope FIRST, children second. An operation row whose envelope is
+    # missing can never be resumed (list_active_batch_ids only walks
+    # ch_perceive_batches) nor swept, so it consumes quota and sits 'queued'
+    # forever — exactly what happened on 2026-07-31 when create_batch raised
+    # UndefinedTable after the operation rows had already been committed.
     # Persist the envelope so a restart can rebuild each PerceiveRequest from
     # the shared options + each operation row's url (JSON-mode dump for JSONB).
     batch_store.create_batch(
@@ -144,6 +147,12 @@ def make_job(
         output_mode=body.output_mode,
         options=body.options.model_dump(mode="json"),
         total=len(entries),
+    )
+    operations.create_queued_operations(
+        batch_id=batch_id,
+        project_id=project_id,
+        entries=[(op_id, str(request.url)) for op_id, request in entries],
+        outputs_requested=list(dict.fromkeys(body.options.outputs)),
     )
     return BatchJob(
         batch_id=batch_id,
@@ -168,10 +177,22 @@ def _load_job(batch_id: str) -> Optional[BatchJob]:
     subscription = get_effective_subscription(row.project_id)
     user = {"id": row.project_id, "subscription": subscription}
     options = dict(row.options or {})
+    # Credentials are deliberately not persisted (batch_store._redact). Resuming
+    # such a batch without them would silently render login walls and bill the
+    # caller for them, so fail the pending rows and tell them to resubmit.
+    redacted = options.pop("_redacted", None)
     requests: list[tuple[str, PerceiveRequest]] = []
     for op in operations.list_batch_operations(batch_id, row.project_id):
         if op.status not in ("queued", "processing"):
             continue  # completed/failed rows are done — never re-rendered
+        if redacted:
+            operations.fail_operation(
+                operation_id=op.operation_id,
+                error_message=(
+                    "batch used credentials that are not stored; resubmit the batch"
+                ),
+            )
+            continue
         try:
             request = PerceiveRequest(**{**options, "url": op.url})
         except Exception:  # noqa: BLE001 — a row we cannot rebuild is failed
@@ -272,7 +293,15 @@ async def process_batch(job: BatchJob) -> list[PerceiveResponse]:
                 items.append(
                     _failed_item(operation_id, str(request.url), str(exc))
                 )
-                await _mark_activity(job, index, "Failed", start, None)
+                await _mark_activity(
+                    job,
+                    index,
+                    "Failed",
+                    start,
+                    None,
+                    error=exc,
+                    error_context=f"url={request.url}",
+                )
 
         job.items = items
         if not stopped_for_cancel:
@@ -320,6 +349,9 @@ async def _mark_activity(
     status: str,
     start: datetime,
     response: Optional[PerceiveResponse],
+    *,
+    error: BaseException | None = None,
+    error_context: str | None = None,
 ) -> None:
     """Best-effort per-URL Activity update (V1 dashboard parity)."""
     if not job.activity_ids or index >= len(job.activity_ids):
@@ -340,6 +372,7 @@ async def _mark_activity(
             object_key=object_key,
             duration=duration,
             count_usage=False,  # coexistence rule 3: V2 never bills V1
+            **error_fields(error, context=error_context),
         )
     except Exception:  # noqa: BLE001
         logger.warning("batch activity update failed", exc_info=True)
@@ -353,47 +386,67 @@ def _zip_member_name(index: int, url: str, output: str, object_key: str) -> str:
     return f"{index + 1:03d}_{slug}_{output}{suffix}"
 
 
+def _spool_artifacts_to_zip(
+    spool: IO[bytes], completed_rows: list[PerceiveOperation]
+) -> None:
+    """Stream every completed row's artifacts from Spaces into a zip on disk.
+
+    Blocking (boto3) — run via asyncio.to_thread. Each S3 body is streamed in
+    64KB chunks straight into its archive member, so no artifact is ever fully
+    resident: the old path buffered every artifact's bytes AND doubled the
+    finished archive via BytesIO.getvalue() — too much for the 1GB droplet.
+    """
+    client = get_s3_client()
+    with zipfile.ZipFile(spool, "w", zipfile.ZIP_DEFLATED) as archive:
+        for index, row in enumerate(completed_rows):
+            # Read object keys straight off the durable row (name ->
+            # {key, size_bytes, content_type}); skip reserved underscore
+            # keys (_fingerprint, _batch_zip). No presign needed — we
+            # download by object key.
+            for output_name, entry in (row.output_keys or {}).items():
+                if output_name.startswith("_") or not isinstance(entry, dict):
+                    continue
+                object_key = entry.get("key")
+                if not object_key:
+                    continue
+                body = client.get_object(
+                    Bucket=DO_SPACES_BUCKET, Key=object_key
+                )["Body"]
+                member_name = _zip_member_name(
+                    index, str(row.url), output_name, object_key
+                )
+                with archive.open(member_name, mode="w") as member:
+                    for chunk in body.iter_chunks(65536):
+                        member.write(chunk)
+    spool.flush()
+
+
 async def _bundle_zip(job: BatchJob, project_id: int, completed_rows) -> Optional[str]:
     """Bundle every completed URL's artifacts into one archive (DB-driven).
 
     Reads the completed ch_perceive_operations rows (works across a resume,
     where this run's ``job.items`` holds only the newly-rendered URLs),
-    rebuilds each row's artifacts from output_keys, downloads the bytes,
-    zips + uploads, and stamps the key on the operation rows (V2 status GET).
-    Returns the zip object key, or None on a bundling failure (artifacts stay
-    individually reachable — the batch downgrades to manifest semantics).
+    rebuilds each row's artifacts from output_keys, streams the bytes into a
+    disk-spooled zip, uploads it, and stamps the key on the operation rows
+    (V2 status GET). Returns the zip object key, or None on a bundling
+    failure (artifacts stay individually reachable — the batch downgrades to
+    manifest semantics).
     """
+    spool = tempfile.NamedTemporaryFile(
+        prefix="v2_batch_zip_", suffix=".zip", delete=False
+    )
     try:
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-            for index, row in enumerate(completed_rows):
-                # Read object keys straight off the durable row (name ->
-                # {key, size_bytes, content_type}); skip reserved underscore
-                # keys (_fingerprint, _batch_zip). No presign needed — we
-                # download by object key.
-                for output_name, entry in (row.output_keys or {}).items():
-                    if output_name.startswith("_") or not isinstance(entry, dict):
-                        continue
-                    object_key = entry.get("key")
-                    if not object_key:
-                        continue
-                    payload = await asyncio.to_thread(
-                        download_from_storage, object_key
-                    )
-                    archive.writestr(
-                        _zip_member_name(
-                            index, str(row.url), output_name, object_key
-                        ),
-                        payload,
-                    )
+        await asyncio.to_thread(_spool_artifacts_to_zip, spool, completed_rows)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S%f")[:-3]
+        spool.seek(0)
         upload = await asyncio.to_thread(
-            upload_to_gcs,
-            buffer.getvalue(),
+            upload_fileobj_to_gcs,
+            spool,
             str(project_id),
             ZIP_ENDPOINT_SEGMENT,
             f"{job.batch_id}_{timestamp}.zip",
+            file_size=os.path.getsize(spool.name),
         )
         zip_key = upload["object_key"]
         job.zip_artifact = OutputArtifact(
@@ -411,6 +464,12 @@ async def _bundle_zip(job: BatchJob, project_id: int, completed_rows) -> Optiona
     except Exception:  # noqa: BLE001 — artifacts stay individually reachable
         logger.exception("batch %s: zip bundling failed", job.batch_id)
         return None
+    finally:
+        spool.close()
+        try:
+            os.unlink(spool.name)
+        except OSError:
+            pass
 
 
 def _ensure_queue() -> asyncio.Queue:

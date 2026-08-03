@@ -25,6 +25,7 @@ from services.browser.converters.browser_manager import (
 )
 from services.browser.converters.errors import ConversionError
 from services.v2_engine import batch_worker, ingest_worker, watch_worker
+from utils import memory
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,13 @@ async def lifespan(app: FastAPI):
     # process singleton.
     posthog_client.init()
     logger.info("[Startup] PostHog analytics initialized")
+
+    # Memory hygiene (2026-07-28 incident): periodic gc + malloc_trim sweep
+    # so heap freed after large conversions is returned to the kernel instead
+    # of sitting in glibc arenas (and then swap) forever. Pairs with the
+    # post-conversion hooks in api/v1/convert.py and utils/processor.py, and
+    # with MALLOC_ARENA_MAX=2 in the systemd unit.
+    memory.start_periodic_trim()
 
     # Startup: Initialize the browser
     logger.info("[Startup] Initializing browser instance...")
@@ -114,6 +122,8 @@ async def lifespan(app: FastAPI):
     logger.info("[Shutdown] V2 ingest worker stopped")
     await batch_worker.shutdown()
     logger.info("[Shutdown] V2 batch worker stopped")
+    await memory.stop_periodic_trim()
+    logger.info("[Shutdown] Periodic memory trim stopped")
     logger.info("[Shutdown] Closing browser instance...")
     await browser_manager.shutdown()
     logger.info("[Shutdown] Browser closed successfully")
@@ -171,18 +181,15 @@ def _check_database() -> bool:
 
 
 def _check_storage() -> bool:
-    """Blocking object-storage liveness probe (run off the event loop)."""
+    """Blocking object-storage liveness probe (run off the event loop).
+
+    Uses the shared boto3 client: building a fresh client per probe (every
+    LB health-check interval) was a steady allocation-churn source feeding
+    glibc arena fragmentation in the long-lived process.
+    """
     try:
-        import boto3
-        region = os.getenv("DO_SPACES_REGION")
-        s3 = boto3.client(
-            's3',
-            region_name=region,
-            endpoint_url=f"https://{region}.digitaloceanspaces.com",
-            aws_access_key_id=os.getenv("DO_SPACES_KEY"),
-            aws_secret_access_key=os.getenv("DO_SPACES_SECRET"),
-        )
-        s3.head_bucket(Bucket=os.getenv("DO_SPACES_BUCKET"))
+        from utils.storage import DO_SPACES_BUCKET, get_s3_client
+        get_s3_client().head_bucket(Bucket=DO_SPACES_BUCKET)
         return True
     except Exception:
         return False
@@ -229,6 +236,21 @@ async def health_check():
     }
     if browser_stats is not None:
         content["browser"] = browser_stats
+
+    # In-gateway CPU-conversion load (image/document/WeasyPrint path) plus
+    # process RSS: the ops memory-guard timer uses these to restart the
+    # service only when it is bloated AND truly idle (browser slots free AND
+    # no non-browser conversion running/queued).
+    try:
+        from api.v1 import convert as v1_convert
+        from utils import memory as memory_utils
+        content["load"] = {
+            "pending_conversions": v1_convert._pending_conversions,
+            "pending_bytes": v1_convert._pending_bytes,
+            "rss_bytes": memory_utils.current_rss_bytes(),
+        }
+    except Exception:  # noqa: BLE001 — observability must not fail /health
+        pass
 
     return JSONResponse(
         status_code=200 if all_healthy else 503,

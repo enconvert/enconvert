@@ -6,6 +6,7 @@ import logging
 
 from api.deps import get_current_user, check_conversion_limit, check_storage_limit, validate_file_size
 from monitoring.metrics import log_activity_start, update_activity_status
+from utils.error_capture import error_fields
 from utils.storage import upload_to_gcs, generate_presigned_url
 
 logger = logging.getLogger("conversion-api-gateway")
@@ -67,7 +68,7 @@ async def upload_capture(
                 )
 
             check_storage_limit(user)
-            validate_file_size(request, user)
+            validate_file_size(request, user, file)
 
             content = await file.read()
             output_file_size = len(content)
@@ -118,10 +119,23 @@ async def upload_capture(
 
         return JSONResponse(status_code=200, content=result)
 
-    except HTTPException:
+    except HTTPException as e:
+        # A rejected capture (missing file, storage limit, oversized upload)
+        # is still a failed capture: without this the row sat 'In Progress'
+        # forever with no recorded cause. Guarded so bookkeeping can never
+        # replace the client's real 4xx with a 500.
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+        try:
+            await update_activity_status(
+                activity_id, "Failed", duration=duration, **error_fields(e),
+            )
+        except Exception:
+            pass
         raise
     except Exception as e:
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-        await update_activity_status(activity_id, "Failed", duration=duration)
+        await update_activity_status(
+            activity_id, "Failed", duration=duration, **error_fields(e),
+        )
         logger.error(f"Extension capture failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Capture logging failed: {str(e)}")

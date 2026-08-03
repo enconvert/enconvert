@@ -1,9 +1,8 @@
 import io
 import os
+import tempfile
 import zipfile
 
-import pypdfium2 as pdfium
-from PIL import Image
 
 # Render scale: 2.0 == 144 DPI (PDFium's base is 72 DPI), matching the previous
 # PyMuPDF ``Matrix(2.0, 2.0)`` output resolution. pypdfium2 (PDFium) is
@@ -27,6 +26,8 @@ def _render_page_to_jpeg(page: "pdfium.PdfPage") -> bytes:
     worker. Mirrors the prior PyMuPDF output otherwise (quality 100, RGBA over
     white).
     """
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     width_pt, height_pt = page.get_size()
     scale = _RENDER_SCALE
     if width_pt > 0 and height_pt > 0:
@@ -58,6 +59,8 @@ def pdf_to_jpeg(file_bytes: bytes, original_filename: str) -> bytes:
     of ``page_1.jpeg`` … ``page_N.jpeg`` (the caller detects the ZIP magic and
     switches the output extension to ``.zip``).
     """
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    import pypdfium2 as pdfium
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext != ".pdf":
         raise ValueError("Expected a PDF file (.pdf)")
@@ -79,12 +82,23 @@ def pdf_to_jpeg(file_bytes: bytes, original_filename: str) -> bytes:
         if page_count == 1:
             return _render_page_to_jpeg(pdf[0])
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for index in range(page_count):
-                jpeg_bytes = _render_page_to_jpeg(pdf[index])
-                zf.writestr(f"page_{index + 1}.jpeg", jpeg_bytes)
-        return zip_buffer.getvalue()
+        # Build the archive on disk, not in a BytesIO: the in-memory ZIP held
+        # every page's JPEG at once and getvalue() then doubled it. Streaming
+        # to a temp file keeps peak memory at one page's working set.
+        # ZIP_STORED because JPEG doesn't deflate — it also saves CPU.
+        zip_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as zip_file:
+                zip_path = zip_file.name  # bound first so finally covers write failures
+                with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_STORED) as zf:
+                    for index in range(page_count):
+                        jpeg_bytes = _render_page_to_jpeg(pdf[index])
+                        zf.writestr(f"page_{index + 1}.jpeg", jpeg_bytes)
+            with open(zip_path, "rb") as f:
+                return f.read()
+        finally:
+            if zip_path is not None and os.path.exists(zip_path):
+                os.unlink(zip_path)
     except ValueError:
         raise
     except Exception as e:

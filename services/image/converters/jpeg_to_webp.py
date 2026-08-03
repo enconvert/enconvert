@@ -1,19 +1,21 @@
-import tempfile 
-import os 
-from PIL import Image 
+import os
+
+from ._limits import ensure_pixel_limit, write_temp_file
 
 def jpeg_to_webp (file_bytes: bytes, original_filename: str) -> bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext not in (".jpg", ".jpeg"):
         raise ValueError("Expected a JPEG file (.jpg or .jpeg)")
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-         temp_file.write(file_bytes)
-         temp_file_path = temp_file.name
+
+    temp_file_path = write_temp_file(file_bytes, ext)
 
     output_file_path = os.path.splitext(temp_file_path)[0] + ".webp"
     try:
         image = Image.open(temp_file_path)
+        # Header-only decompression-bomb gate: reject before any decode.
+        ensure_pixel_limit(image)
 
         if image.mode != "RGB":
             image = image.convert("RGB")
@@ -32,17 +34,19 @@ def jpeg_to_webp (file_bytes: bytes, original_filename: str) -> bytes:
 
 
 def webp_to_jpeg(file_bytes: bytes, original_filename:str) ->bytes:
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext not in (".webp"):
         raise ValueError("Expected a WEBP file (.webp)")
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-         temp_file.write(file_bytes)
-         temp_file_path = temp_file.name
+    temp_file_path = write_temp_file(file_bytes, ext)
 
     output_file_path = os.path.splitext(temp_file_path)[0] + ".jpeg"
     try:
         image = Image.open(temp_file_path)
+        # Header-only decompression-bomb gate: reject before any decode.
+        ensure_pixel_limit(image)
 
         if image.mode == "RGBA":
             background = Image.new("RGB", image.size, (255, 255, 255))

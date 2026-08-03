@@ -14,9 +14,17 @@ def convert_to_pdf(
     ext = os.path.splitext(original_filename or "")[1].lower()
     if not ext:
         raise ValueError("cannot determine file type:missing file extension")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_file.write(file_bytes)
-        temp_file_path = temp_file.name
+    # Path bound before the write, and unlinked on a failed write (e.g.
+    # ENOSPC): the write happens before the try/finally below is entered, so
+    # a failure there would otherwise leak the temp file forever.
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    temp_file_path = temp_file.name
+    try:
+        with temp_file:
+            temp_file.write(file_bytes)
+    except BaseException:
+        os.unlink(temp_file_path)
+        raise
 
     output_file_path = temp_file_path.replace(ext, ".pdf")
     try:

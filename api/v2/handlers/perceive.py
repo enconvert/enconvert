@@ -36,6 +36,7 @@ from api.v2.schemas.perceive import (
 from api.v2.handlers.perceive_status import _response_from_operation
 from monitoring.metrics import log_activity_start, update_activity_status
 from services.v2_engine import batch_store, batch_worker, operations, perceive_flow
+from utils.error_capture import error_fields
 from utils.processor import validate_auth_cookies_headers
 from utils.storage import generate_presigned_url
 
@@ -101,8 +102,8 @@ async def perceive(
 
     try:
         response = await perceive_flow.run(body, operation_id, user)
-    except HTTPException:
-        await _mark_activity(activity_id, "Failed", start)
+    except HTTPException as exc:
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         raise
     except Exception as exc:
         # Full detail goes to server logs only; the client gets a generic
@@ -110,7 +111,7 @@ async def perceive(
         # exception text can carry internal paths / library internals
         # (Playwright CDP, boto3, SQLAlchemy) — never echo it.
         logger.exception("/v2/perceive failed for %s", body.url)
-        await _mark_activity(activity_id, "Failed", start)
+        await _mark_activity(activity_id, "Failed", start, error=exc)
         posthog_client.capture_project_event(user["id"], "v2_perceive_failed", {
             "operation_id": operation_id,
             "url_domain": url_domain,
@@ -348,6 +349,8 @@ async def _mark_activity(
     output_file_size: int = 0,
     object_key: str = "",
     content_hash: str | None = None,
+    error: BaseException | None = None,
+    error_context: str | None = None,
 ) -> None:
     """Best-effort activity update; never masks the request outcome."""
     duration = (datetime.now(timezone.utc) - start).total_seconds()
@@ -360,6 +363,7 @@ async def _mark_activity(
             duration=duration,
             content_hash=content_hash,
             count_usage=False,  # coexistence rule 3: V2 never bills V1
+            **error_fields(error, context=error_context),
         )
     except Exception:  # noqa: BLE001
         logger.warning("activity update failed", exc_info=True)

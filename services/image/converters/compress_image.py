@@ -27,11 +27,12 @@ reduce pixel size keeping the aspect ratio constant"):
 Pillow-only (HPND/MIT-CMU, permissive). Deliberately avoids GPL-licensed
 tools such as pngquant, jpegoptim and gifsicle, per licensing policy.
 """
+from __future__ import annotations
+
 import io
 import math
 import os
 
-from PIL import Image
 
 _SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 _EXT_TO_FORMAT = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
@@ -69,6 +70,8 @@ def _preserved_metadata(image: Image.Image) -> dict:
     EXIF block instead of transposing pixels, which would break the JPEG
     quality='keep' lossless path.
     """
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     kwargs: dict = {}
     icc_profile = image.info.get("icc_profile")
     if icc_profile:
@@ -108,11 +111,15 @@ def _webp_is_lossless(file_bytes: bytes) -> bool:
     return False
 
 
-def _png_candidates(image: Image.Image, meta: dict) -> list[bytes]:
-    candidates = []
+def _png_candidates(image: Image.Image, meta: dict) -> bytes:
+    """Best lossless PNG re-encode. Candidates are compared incrementally so
+    only the current winner is held — at the 40 MP cap each encoding is tens
+    of MB, and a list of all of them would keep every loser alive at once."""
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image, ImageChops
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=True, compress_level=9, **meta)
-    candidates.append(buffer.getvalue())
+    best = buffer.getvalue()
     # Palette candidate: only when provably lossless (exact roundtrip).
     if image.mode in _PALETTE_SOURCE_MODES:
         try:
@@ -121,39 +128,44 @@ def _png_candidates(image: Image.Image, meta: dict) -> list[bytes]:
                 palette_image = image.convert(
                     "P", palette=Image.ADAPTIVE, colors=max(2, min(256, len(colors)))
                 )
-                if palette_image.convert(image.mode).tobytes() == image.tobytes():
+                # ImageChops runs the comparison in C without materializing two
+                # full tobytes() buffers (~320 MB at the 40 MP cap).
+                # alpha_only=False: getbbox defaults to inspecting only the
+                # alpha band on RGBA/LA, which would pass a color-lossy palette.
+                difference = ImageChops.difference(
+                    palette_image.convert(image.mode), image
+                )
+                if difference.getbbox(alpha_only=False) is None:
                     palette_buffer = io.BytesIO()
                     palette_image.save(palette_buffer, format="PNG", optimize=True, **meta)
-                    candidates.append(palette_buffer.getvalue())
+                    # tell() is the encoded size — copy out only if it wins.
+                    if palette_buffer.tell() < len(best):
+                        best = palette_buffer.getvalue()
         except Exception:
             pass  # palette path is opportunistic; the plain re-encode stands
-    return candidates
+    return best
 
 
-def _jpeg_candidates(image: Image.Image, meta: dict) -> list[bytes]:
-    candidates = []
+def _jpeg_candidates(image: Image.Image, meta: dict) -> bytes | None:
     try:
         buffer = io.BytesIO()
         # quality='keep' reuses the source's quantization tables: entropy
         # coding is re-optimized, no further quantization loss is introduced.
         image.save(buffer, format="JPEG", quality="keep", optimize=True,
                    progressive=True, **meta)
-        candidates.append(buffer.getvalue())
+        return buffer.getvalue()
     except Exception:
-        pass  # 'keep' requires a JPEG source image; fail open to the original
-    return candidates
+        return None  # 'keep' requires a JPEG source image; fail open to the original
 
 
-def _webp_candidates(image: Image.Image, meta: dict) -> list[bytes]:
-    candidates = []
+def _webp_candidates(image: Image.Image, meta: dict) -> bytes | None:
     try:
         buffer = io.BytesIO()
         method = _webp_method(image.width * image.height)
         image.save(buffer, format="WEBP", lossless=True, quality=100, method=method, **meta)
-        candidates.append(buffer.getvalue())
+        return buffer.getvalue()
     except Exception:
-        pass
-    return candidates
+        return None
 
 
 _LOSSLESS_ENCODERS = {
@@ -171,6 +183,8 @@ def _encode_scaled(
     webp_lossless: bool,
 ) -> bytes:
     """Encode the image at `scale` (aspect ratio locked, LANCZOS)."""
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     new_width = max(1, round(image.width * scale))
     new_height = max(1, round(image.height * scale))
     if (new_width, new_height) == image.size:
@@ -180,7 +194,7 @@ def _encode_scaled(
 
     buffer = io.BytesIO()
     if fmt == "PNG":
-        return min(_png_candidates(resized, meta), key=len)
+        return _png_candidates(resized, meta)
     if fmt == "JPEG":
         if resized.mode not in ("RGB", "L", "CMYK"):
             resized = resized.convert("RGB")
@@ -213,6 +227,8 @@ def compress_image(
         The compressed bytes — never larger than the input when no target is
         set; best-effort smallest when a target is set but unreachable.
     """
+    # lazy import: keep the heavy native lib off idle RAM (B3)
+    from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext not in _SUPPORTED_EXTENSIONS:
         raise ValueError(
@@ -254,9 +270,11 @@ def compress_image(
     webp_lossless_source = fmt == "WEBP" and _webp_is_lossless(file_bytes)
 
     # ---- Stage 1: lossless (the original bytes always compete) -------------
-    candidates = [file_bytes]
-    candidates += _LOSSLESS_ENCODERS[fmt](image, meta)
-    best = min(candidates, key=len)
+    encoded = _LOSSLESS_ENCODERS[fmt](image, meta)
+    best = encoded if encoded is not None and len(encoded) < len(file_bytes) else file_bytes
+    # Drop a losing re-encode immediately — it can be tens of MB and would
+    # otherwise stay alive through all of stage 2's iterations.
+    del encoded
 
     if target_size_kb is None:
         return best

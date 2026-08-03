@@ -435,13 +435,21 @@ async def render_html(
     headers: Optional[dict[str, str]] = None,
     cookies: Optional[list[dict[str, Any]]] = None,
     auth: Optional[dict[str, Any]] = None,
+    allow_tls: bool = True,
 ) -> RenderedPage:
     """Render one URL to HTML — no persistence, no quota, no uploads.
 
     The lightweight render entry point distill/ingest/watch depend on.
     Raises (RuntimeError / HTTPException) on a failed render exactly like
     ``run`` does; callers catch per URL.
+
+    ``allow_tls`` is accepted and ignored. In the full build it drops the
+    no-browser TLS rung from the render ladder, which ``watch_flow`` sets so a
+    watch check never changes capture method mid-baseline. This open build has
+    no engine ladder, so there is nothing to disable — the parameter exists
+    only to keep this signature call-compatible with ``watch_flow``.
     """
+    del allow_tls  # no ladder in the open build; see docstring
     clean = url.strip()
     await assert_public_http_url(clean)
     if respect_robots:

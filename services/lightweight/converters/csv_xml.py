@@ -1,6 +1,6 @@
 import csv
 import xmltodict
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
 
 
 def csv_to_xml(csv_bytes: bytes) -> bytes:
@@ -26,9 +26,14 @@ def csv_to_xml(csv_bytes: bytes) -> bytes:
             raise ValueError("CSV file is empty or has no valid rows")
 
         wrapped_data = {'root': {'item': data}}
-        xml_str = xmltodict.unparse(wrapped_data, pretty=True, indent='  ')
+        # unparse writes straight into UTF-8 bytes via the wrapper: the str +
+        # .encode() path held two full copies of the output at peak.
+        buf = BytesIO()
+        wrapper = TextIOWrapper(buf, encoding='utf-8', newline='')
+        xmltodict.unparse(wrapped_data, output=wrapper, pretty=True, indent='  ')
+        wrapper.flush()
 
-        return xml_str.encode('utf-8')
+        return buf.getvalue()
     except UnicodeDecodeError:
         raise ValueError("Invalid CSV encoding (expected UTF-8)")
     except Exception as e:

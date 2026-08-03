@@ -1,5 +1,7 @@
 
 import json
+from io import BytesIO, TextIOWrapper
+
 import xmltodict
 
 def json_to_xml(json_bytes: bytes) -> bytes:
@@ -26,9 +28,16 @@ def json_to_xml(json_bytes: bytes) -> bytes:
         else:
             wrapped_data = {'root': {'value': data}}
             
-        xml_str = xmltodict.unparse(wrapped_data, pretty=True, indent=' ')
-        
-        return xml_str.encode('utf-8')
+        # unparse writes straight into UTF-8 bytes via the wrapper: the str +
+        # .encode() path held two full copies of the output at peak. A strict
+        # text wrapper (not a raw BytesIO) keeps encode-error behavior and
+        # newline handling identical to the old string path.
+        buf = BytesIO()
+        wrapper = TextIOWrapper(buf, encoding='utf-8', newline='')
+        xmltodict.unparse(wrapped_data, output=wrapper, pretty=True, indent=' ')
+        wrapper.flush()
+
+        return buf.getvalue()
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON: {str(e)}")
     except Exception as e:
@@ -59,9 +68,13 @@ def xml_to_json(xml_bytes: bytes) -> bytes:
             if isinstance(data, dict) and 'item' in data and len(data) == 1:
                 data = data['item']
 
-        json_str = json.dumps(data, indent=2, ensure_ascii=False)
+        # Same single-copy streaming as json_to_xml above.
+        buf = BytesIO()
+        wrapper = TextIOWrapper(buf, encoding='utf-8', newline='')
+        json.dump(data, wrapper, indent=2, ensure_ascii=False)
+        wrapper.flush()
 
-        return json_str.encode('utf-8')
+        return buf.getvalue()
 
     except Exception as e:
         raise ValueError(f"XML to JSON conversion failed: {str(e)}")

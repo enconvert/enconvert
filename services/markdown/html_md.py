@@ -143,7 +143,9 @@ def _detect_code_language(pre_el) -> str:
     return ""
 
 
-def _preprocess_html(html: str, base_url: str, tags: tuple = BOILERPLATE_TAGS) -> str:
+def _preprocess_soup(
+    html: str, base_url: str, tags: tuple = BOILERPLATE_TAGS
+) -> BeautifulSoup:
     """Normalise article/document HTML before Markdown conversion.
 
     - Resolves relative <a href> and <img src> against base_url (a no-op when
@@ -151,6 +153,9 @@ def _preprocess_html(html: str, base_url: str, tags: tuple = BOILERPLATE_TAGS) -
     - Removes ``tags`` (boilerplate for articles, non-content noise for files).
     - Drops empty / fragment-only links by unwrapping them.
     - Strips noisy attributes (style, class, id) and any on* event handlers.
+
+    Returns the live soup so callers can convert it directly (convert_soup)
+    without a serialize + re-parse round trip.
     """
     soup = BeautifulSoup(html, "lxml")
 
@@ -179,7 +184,13 @@ def _preprocess_html(html: str, base_url: str, tags: tuple = BOILERPLATE_TAGS) -
             if attr in NOISE_ATTRS or attr.startswith("on"):
                 del el[attr]
 
-    return str(soup)
+    return soup
+
+
+def _preprocess_html(html: str, base_url: str, tags: tuple = BOILERPLATE_TAGS) -> str:
+    """Serialized form of ``_preprocess_soup`` — kept for the web path
+    (``url_markdown``), whose string pipeline is locked byte-for-byte by tests."""
+    return str(_preprocess_soup(html, base_url, tags))
 
 
 def _postprocess_markdown(md: str) -> str:
@@ -221,6 +232,9 @@ def html_to_markdown(
         # they do not surface as literal text. The web path never sees these.
         html = _XML_PI_RE.sub("", html)
         tags = NON_CONTENT_TAGS
-    normalised = _preprocess_html(html, base_url, tags)
-    markdown = _ArticleMarkdownConverter().convert(normalised)
+    # convert_soup (public markdownify API) consumes the preprocessed tree
+    # directly — ``convert()`` would serialize it and re-parse with html.parser,
+    # holding two full DOMs at peak on a 1GB box for identical output.
+    soup = _preprocess_soup(html, base_url, tags)
+    markdown = _ArticleMarkdownConverter().convert_soup(soup)
     return _postprocess_markdown(markdown)

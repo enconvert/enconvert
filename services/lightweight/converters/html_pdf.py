@@ -1,4 +1,3 @@
-from weasyprint import HTML
 from models import PdfOptions
 from utils.pdf_helpers import build_weasyprint_page_css, weasyprint_zoom
 
@@ -17,6 +16,8 @@ def html_to_pdf(html_bytes: bytes, pdf_options: PdfOptions = None) -> bytes:
     Raises:
         ValueError: If HTML is invalid or conversion fails
     """
+    # WeasyPrint imported lazily (kept off idle RAM until a PDF is rendered).
+    from weasyprint import HTML
     try:
         html_str = html_bytes.decode('utf-8')
 

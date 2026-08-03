@@ -1,8 +1,8 @@
 <h1 align="center">EnConvert</h1>
 
 <p align="center">
-  <b>The web lies to your agent. EnConvert doesn't.</b><br/>
-  One API reads any file (46 formats) and any page into clean Markdown, JSON, screenshots, or PDF — and tells you when a read was blocked.
+  HTTP API for converting files and reading web pages.<br/>
+  Accepts a URL or a file and returns Markdown, JSON, HTML, a screenshot, or a PDF. Supports 46 file formats.
 </p>
 
 <p align="center">
@@ -13,35 +13,35 @@
 
 ---
 
-An LLM is brilliant and blind. Hand it a URL and it will confidently summarize a Cloudflare challenge, a cookie wall, or an empty SPA shell — and never tell you. Scrapers stop at pages. Converters stop at files. Your agent needs both, and it shouldn't take two vendors to get them.
+EnConvert reads two kinds of input through one API: files, which it converts between formats, and web pages, which it renders and returns as text or images.
 
-EnConvert is the conversion and reading layer for agents: point it at a URL or a file, get back clean Markdown, JSON, a screenshot, or a PDF. This repository is the **open-source API** — the orchestration, routing, storage, jobs, and self-hostable engine — under the AGPL-3.0. The managed cloud at [enconvert.com](https://enconvert.com) runs this same code plus the advanced rendering engine and the quality scoring that make reads trustworthy at scale.
+This repository is the API under AGPL-3.0: request routing, the conversion pipelines, storage, background jobs, and a self-hostable render path. The hosted service at [enconvert.com](https://enconvert.com) runs this code together with additional closed components — the multi-engine render ladder, anti-bot rendering, render-quality scoring, LLM-based extraction, and semantic diffing. The table under [Open source vs Cloud](#open-source-vs-cloud) lists exactly which parts are in this repository and which are not.
 
-## Six verbs, one API
+## Endpoints
 
 | Verb | | What it does |
 |---|---|---|
-| **perceive** | `URL → MD/JSON/PNG/PDF` | Render any URL once and return Markdown, HTML, a screenshot, a PDF, links, and structured data. |
-| **convert** | `FILE → FILE` | Open 46 file types in one request — PDF, DOCX, XLSX, PPTX, HEIC, SVG, CSV, and more, in and out. |
-| **discover** | `SITE → URL MAP` | Map every URL on a site from its sitemap and an HTTP crawl, without rendering a page. |
-| **lookup** | `QUERY → RESULTS` | Search the live web (web, news, scholar, maps) from inside the conversation. |
-| **distill** | `SCHEMA → JSON` | Pass a schema, get structured data back from any page. |
-| **ingest** | `SITE → CHUNKS` | Crawl a whole site into RAG-ready JSONL chunks in one call. |
-| **watch** | `PAGE → DIFF` | Get a webhook the moment a page you track changes. |
+| **perceive** | `URL → MD/JSON/PNG/PDF` | Renders a URL once and returns Markdown, HTML, a screenshot, a PDF, extracted links, and structured data. |
+| **convert** | `FILE → FILE` | Converts between 46 file types, including PDF, DOCX, XLSX, PPTX, HEIC, SVG, and CSV. |
+| **discover** | `SITE → URL MAP` | Lists a site's URLs from its sitemap and an HTTP crawl, without rendering pages. |
+| **lookup** | `QUERY → RESULTS` | Queries web, news, scholar, and maps search. |
+| **distill** | `SCHEMA → JSON` | Extracts structured data from a page against a schema you supply. |
+| **ingest** | `SITE → CHUNKS` | Crawls a site and returns JSONL chunks suitable for RAG indexing. |
+| **watch** | `PAGE → DIFF` | Checks a page on a schedule and sends a webhook when it changes. |
 
 ## Quick start (hosted)
 
-Grab an API key at [enconvert.com](https://enconvert.com), then:
+Create an API key at [enconvert.com](https://enconvert.com), then:
 
 ```bash
-# perceive: a live page → clean Markdown for your LLM pipeline
+# perceive: a live page → Markdown
 curl -X POST https://api.enconvert.com/v2/perceive \
   -H "X-API-Key: YOUR_API_KEY" -H "Content-Type: application/json" \
   -d '{"url": "https://example.com", "outputs": ["markdown"]}'
 ```
 
 ```bash
-# convert: any file → PDF
+# convert: a URL → PDF
 curl -X POST https://api.enconvert.com/v1/convert/url-to-pdf \
   -H "X-API-Key: YOUR_API_KEY" -H "Content-Type: application/json" \
   -d '{"url": "https://example.com"}'
@@ -55,11 +55,13 @@ cd enconvert
 docker compose up
 ```
 
-The self-hosted build handles the commodity conversions out of the box and renders pages with a plain headless browser. See **[SELF_HOST.md](./SELF_HOST.md)** for the full capability list and configuration.
+The self-hosted build performs the file conversions and renders pages with a plain headless browser. See **[SELF_HOST.md](./SELF_HOST.md)** for the full capability list and configuration.
 
-## Every read comes with a receipt
+## Render quality scoring
 
-The hardest part of reading the web isn't fetching a page — it's knowing whether what came back is real. The **EnConvert cloud** scores every read (`render_quality`, 0.0–1.0): a blocked or login-walled page comes back *flagged*, not passed off as content. That plus real anti-bot rendering, cross-result answer synthesis, and semantic change diffing is what the cloud adds on top of this open core.
+A page fetch can succeed at the HTTP level and still return something other than the page — an anti-bot challenge, a login wall, a cookie interstitial, or an unhydrated SPA shell. Downstream consumers usually cannot tell the difference from the response body alone.
+
+The hosted service scores every read as `render_quality` (0.0–1.0) and flags a blocked or login-walled result rather than returning it as ordinary content. This scoring is not part of the open build; a self-hosted render returns whatever the browser produced, unscored.
 
 ## Open source vs Cloud
 
@@ -76,7 +78,7 @@ The hardest part of reading the web isn't fetching a page — it's knowing wheth
 | distill: schema → structured JSON | CSS pass | **+ LLM extraction** |
 | Managed dashboard, teams, billing | — | ✅ |
 
-The eyes are real today. The advanced engine, the scoring, and the semantic layer live in the cloud — this repo is the honest open core they run on.
+Rows marked — are absent from this repository. The self-hosted build is functional without them: it converts files, maps sites, crawls to chunks, and renders pages with a plain headless browser.
 
 ## SDKs
 
@@ -87,7 +89,7 @@ Official SDKs are MIT-licensed and default to the cloud API:
 
 ## License
 
-EnConvert is open source under **AGPL-3.0** — see [LICENSE](./LICENSE). The SDKs and MCP server are **MIT**. The managed cloud at [enconvert.com](https://enconvert.com) includes additional features.
+EnConvert is open source under **AGPL-3.0** — see [LICENSE](./LICENSE). The SDKs and MCP server are **MIT**. The hosted service at [enconvert.com](https://enconvert.com) includes the additional components listed above.
 
 ---
 
