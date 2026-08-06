@@ -48,12 +48,17 @@ from services.v2_engine import operations, usage
 from services.v2_engine.crawl4ai_processors import (
     extract_headings,
     extract_json_ld,
-    generate_fit_markdown,
     generate_markdown_bytes,
     scrap_html,
     serialize_images,
     serialize_links,
     serialize_tables,
+)
+from services.markdown.html_md import html_to_markdown
+from services.v2_engine.main_content import (
+    ContentCandidate,
+    extract_main_content,
+    select_main_content,
 )
 from services.v2_engine.url_safety import assert_public_http_url
 from utils.pdf_postprocess import convert_to_grayscale
@@ -66,7 +71,6 @@ V2_PERCEIVE_ENDPOINT = "v2-perceive"  # Spaces path segment
 
 _EXTENSIONS: dict[str, str] = {
     "markdown": ".md",
-    "markdown_fit": ".md",
     "html_cleaned": ".html",
     "html_raw": ".html",
     "screenshot": ".png",
@@ -174,6 +178,9 @@ def _fingerprint(request: PerceiveRequest, outputs: list[str]) -> str:
     payload: dict[str, Any] = {
         "url": str(request.url),
         "outputs": sorted(outputs),
+        # only_main_content reshapes the markdown artifact; direct_download
+        # is delivery-only and deliberately absent.
+        "only_main_content": request.only_main_content,
         "extract": sorted(request.extract),
         "schema": request.extraction_schema,
         "pdf_options": request.pdf_options.model_dump()
@@ -190,6 +197,29 @@ def _fingerprint(request: PerceiveRequest, outputs: list[str]) -> str:
         "auth": request.auth.model_dump() if request.auth else None,
     }
     return operations.request_fingerprint(payload)
+
+
+def _options_echo(request: PerceiveRequest, outputs: list[str]) -> dict[str, Any]:
+    """The honoured request options, secrets redacted to booleans (A3)."""
+    return {
+        "outputs": list(outputs),
+        "only_main_content": request.only_main_content,
+        "extract": list(request.extract),
+        "cache_mode": request.cache_mode,
+        "mobile": request.mobile,
+        "respect_robots": request.respect_robots,
+        "direct_download": request.direct_download,
+        "wait_for": request.wait_for,
+        "wait_timeout_ms": request.wait_timeout_ms,
+        "viewport": request.viewport.model_dump() if request.viewport else None,
+        "block_resources": list(request.block_resources),
+        "js_code_provided": bool(request.js_code),
+        "schema_provided": request.extraction_schema is not None,
+        "pdf_options_provided": request.pdf_options is not None,
+        "auth_provided": request.auth is not None,
+        "cookies_provided": bool(request.cookies),
+        "headers_provided": bool(request.headers),
+    }
 
 
 async def _check_robots(url: str) -> None:
@@ -515,6 +545,8 @@ async def run(
                 return _serve_from_cache(
                     cached, operation_id, project_id, url, outputs, start,
                     batch_id=batch_id,
+                    request=request,
+                    request_warnings=warnings,
                 )
             except Exception as exc:
                 operations.fail_operation(
@@ -581,6 +613,7 @@ async def run(
             url_final=captured.final_url,
             content_hash=content_hash,
             render_quality=None,
+            options_echo=_options_echo(request, outputs),
             cache_hit=False,
             outputs=outputs_from_keys(output_keys, project_id),
             structured=structured,
@@ -610,6 +643,8 @@ def _serve_from_cache(
     outputs: list[str],
     start: float,
     batch_id: Optional[str] = None,
+    request: Optional[PerceiveRequest] = None,
+    request_warnings: Optional[list[str]] = None,
 ) -> PerceiveResponse:
     """Record a cache-hit operation and answer from the cached row."""
     operations.create_operation(
@@ -620,11 +655,17 @@ def _serve_from_cache(
         batch_id=batch_id,
     )
     duration_ms = int((time.monotonic() - start) * 1000)
+    cached_keys = dict(cached.output_keys or {})
+    # F1: the hit row must NOT inherit the render row's fingerprint —
+    # otherwise a hit row (fresh created_at, live fingerprint) is itself
+    # a cache candidate and an hourly poller renews the TTL forever.
+    hit_row_keys = dict(cached_keys)
+    hit_row_keys.pop(operations.FINGERPRINT_KEY, None)
     operations.complete_operation(
         operation_id=operation_id,
         url_final=cached.url_final,
         content_hash=cached.content_hash,
-        output_keys=cached.output_keys or {},
+        output_keys=hit_row_keys,
         structured_data=cached.structured_data,
         extraction_tier=cached.extraction_tier,
         cache_hit=True,
@@ -638,15 +679,20 @@ def _serve_from_cache(
         url=url,
         url_final=cached.url_final,
         content_hash=cached.content_hash,
+        status_code=cached_keys.get(operations.HTTP_STATUS_KEY),
         render_quality=cached.render_quality_score,
+        deductions=dict(cached_keys.get(operations.DEDUCTIONS_KEY) or {}),
+        options_echo=(
+            _options_echo(request, outputs) if request is not None else None
+        ),
         cache_hit=True,
-        outputs=outputs_from_keys(cached.output_keys, project_id),
+        outputs=outputs_from_keys(cached_keys, project_id),
         structured=cached.structured_data,
         extraction_tier=cached.extraction_tier,  # type: ignore[arg-type]
         tokens=PerceiveTokens(),
         cost_cents=0.0,
         duration_ms=duration_ms,
-        warnings=[],
+        warnings=list(request_warnings or []),
     )
 
 
@@ -662,24 +708,71 @@ def _process_outputs(
     final_url = carried.final_url or str(request.url)
 
     scraping = None
+    # The scrap pass feeds links/images/html_cleaned/metadata/tables and
+    # the FULL-page markdown; the main-content markdown path has its own
+    # extractor and does not need it.
     needs_scrap = bool(extracts) or any(
-        name in outputs for name in ("markdown", "html_cleaned", "links", "images")
-    )
+        name in outputs for name in ("html_cleaned", "links", "images")
+    ) or ("markdown" in outputs and not request.only_main_content)
     if needs_scrap:
         scraping = scrap_html(final_url, html)
 
     artifacts: dict[str, bytes] = {}
     cleaned_html = (scraping.cleaned_html or "") if scraping else ""
-    fit_bytes: Optional[bytes] = None
+    main_bytes: Optional[bytes] = None
+
+    wants_main = request.only_main_content and "markdown" in outputs
+    if wants_main or "main_content" in extracts:
+        # B4 candidate ensemble: structural strip vs Readability vs the
+        # full page, scored by prose retention + code-block retention vs
+        # nav chrome; the full page always remains eligible so an
+        # over-aggressive extractor can never ship a stub.
+        candidates: list[ContentCandidate] = []
+        extraction = extract_main_content(html)
+        if not extraction.aborted:
+            structural_md = generate_markdown_bytes(
+                extraction.html, final_url, images_to_alt=True
+            ).decode("utf-8", errors="replace")
+            if structural_md.strip():
+                candidates.append(
+                    ContentCandidate(
+                        source="structural", markdown=structural_md
+                    )
+                )
+        try:
+            readability_md = html_to_markdown(
+                html, final_url, extract_article=True
+            )
+            if readability_md.strip():
+                candidates.append(
+                    ContentCandidate(
+                        source="readability", markdown=readability_md
+                    )
+                )
+        except Exception:  # noqa: BLE001 — a candidate failing is fine
+            logger.warning(
+                "readability candidate failed for %s", final_url,
+                exc_info=True,
+            )
+        full_page_md = generate_markdown_bytes(
+            html, final_url, images_to_alt=True
+        ).decode("utf-8", errors="replace")
+        selected = select_main_content(candidates, full_page_md)
+        if selected.fell_back_to_full_page and candidates:
+            warnings.append(
+                "only_main_content: no extraction retained enough of the "
+                "page's content; returned the full page instead "
+                "(fidelity guard)."
+            )
+        main_bytes = selected.markdown.encode("utf-8")
 
     if "markdown" in outputs:
-        artifacts["markdown"] = generate_markdown_bytes(
-            cleaned_html or html, final_url
-        )
-    if "markdown_fit" in outputs or "main_content" in extracts:
-        fit_bytes = generate_fit_markdown(html, final_url)
-    if "markdown_fit" in outputs and fit_bytes is not None:
-        artifacts["markdown_fit"] = fit_bytes
+        if request.only_main_content and main_bytes is not None:
+            artifacts["markdown"] = main_bytes
+        else:
+            artifacts["markdown"] = generate_markdown_bytes(
+                cleaned_html or html, final_url
+            )
     if "html_cleaned" in outputs:
         artifacts["html_cleaned"] = (cleaned_html or html).encode("utf-8")
     if "html_raw" in outputs:
@@ -710,8 +803,13 @@ def _process_outputs(
             structured["headings"] = extract_headings(cleaned_html or html)
         if "tables" in extracts and scraping is not None:
             structured["tables"] = serialize_tables(scraping)
-        if "main_content" in extracts and fit_bytes is not None:
-            text = fit_bytes.decode("utf-8", errors="replace")
+        if "main_content" in extracts and main_bytes is not None:
+            text = main_bytes.decode("utf-8", errors="replace")
+            if not text.strip():
+                warnings.append(
+                    "main_content extraction produced no text for this "
+                    "page; the field is empty."
+                )
             if len(text) > _MAIN_CONTENT_MAX_CHARS:
                 text = text[:_MAIN_CONTENT_MAX_CHARS]
                 warnings.append(

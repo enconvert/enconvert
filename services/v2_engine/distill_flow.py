@@ -57,6 +57,7 @@ from api.v2.schemas.distill import (
 from models import DistillOperation
 from services.v2_engine import discover_flow, perceive_flow, usage
 from services.v2_engine.extractors import json_css, schema_llm
+from services.v2_engine.quality import QUALITY_FLOOR
 from utils.postgres import get_db
 
 logger = logging.getLogger(__name__)
@@ -345,7 +346,13 @@ async def _distill_one_url(
     cost_cents = Decimal("0")
     tokens = DistillTokens()
     if missing:
-        skip = _llm_skip_reason(missing, llm_enabled, rendered.is_blocked, llm_budget)
+        # D6 (QA report 2026-08-06): gate on the full quality floor, not
+        # just is_blocked — a 404 / empty shell / unhydrated render has
+        # nothing to extract either.
+        low_quality = (
+            rendered.is_blocked or rendered.render_quality < QUALITY_FLOOR
+        )
+        skip = _llm_skip_reason(missing, llm_enabled, low_quality, llm_budget)
         if skip is not None:
             item_warnings.append(skip)
         else:
@@ -404,7 +411,8 @@ def _llm_skip_reason(
     if is_blocked:
         return (
             "LLM extraction skipped: render quality flagged the page as "
-            "blocked by anti-bot protection; returned CSS-only."
+            "blocked or below the quality floor (anti-bot page, error "
+            "page, or failed render); returned CSS-only."
         )
     if (
         llm_budget.spent >= _REQUEST_LLM_BUDGET_CENTS

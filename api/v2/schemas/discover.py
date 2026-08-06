@@ -24,9 +24,13 @@ DiscoverMode = Literal["sitemap", "crawl", "hybrid"]
 
 
 class DiscoverRequest(BaseModel):
-    """One /v2/discover request (plan section 4)."""
+    """One /v2/discover request (plan section 4).
 
-    model_config = ConfigDict(populate_by_name=True)
+    ``extra="forbid"``: unknown keys 422 with the field name instead of
+    being silently dropped (2026-08-06 QA root-cause report, fix A1).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     url: str = Field(max_length=2048)
     mode: DiscoverMode = "hybrid"

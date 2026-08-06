@@ -37,6 +37,13 @@ FINGERPRINT_KEY = "_fingerprint"
 # output_mode="zip" batch (F.8).
 BATCH_ZIP_KEY = "_batch_zip"
 
+# Reserved keys inside output_keys (QA report 2026-08-06, fixes D1/D4):
+# the main-document HTTP status and the fired quality deductions for
+# this render, so GET /v2/perceive/{id} and cache hits can return them.
+# Underscore-prefixed keys are never presented as outputs.
+HTTP_STATUS_KEY = "_http_status"
+DEDUCTIONS_KEY = "_deductions"
+
 CACHE_TTL_SECONDS = 3600  # plan section 4: 1 h TTL
 
 
@@ -347,6 +354,11 @@ def find_cached_operation(
                 PerceiveOperation.project_id == project_id,
                 PerceiveOperation.url == url,
                 PerceiveOperation.status == "completed",
+                # F1 (QA report 2026-08-06): cache-hit rows are NOT cache
+                # candidates. Before this, a hit row (fresh created_at,
+                # copied fingerprint) renewed the 1 h TTL indefinitely —
+                # an hourly poller would never see a fresh render again.
+                PerceiveOperation.cache_hit == False,  # noqa: E712
                 PerceiveOperation.created_at >= cutoff,
             )
             .order_by(PerceiveOperation.created_at.desc())  # type: ignore[union-attr]

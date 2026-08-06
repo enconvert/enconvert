@@ -78,9 +78,13 @@ class LookupEnrich(BaseModel):
 
 
 class LookupRequest(BaseModel):
-    """One /v2/lookup request (plan section 4 / section 8 Task H.3)."""
+    """One /v2/lookup request (plan section 4 / section 8 Task H.3).
 
-    model_config = ConfigDict(populate_by_name=True)
+    ``extra="forbid"``: unknown keys 422 with the field name instead of
+    being silently dropped (2026-08-06 QA root-cause report, fix A1).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     query: str = Field(min_length=1, max_length=512)
     category: SearchCategory = "web"

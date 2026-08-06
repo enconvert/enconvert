@@ -25,7 +25,6 @@ from models import PdfOptions
 
 OutputName = Literal[
     "markdown",
-    "markdown_fit",
     "html_cleaned",
     "html_raw",
     "screenshot",
@@ -67,7 +66,6 @@ CacheMode = Literal["enabled", "bypass", "refresh"]
 # which is inline in the response and persisted as JSONB).
 ARTIFACT_OUTPUTS: tuple[str, ...] = (
     "markdown",
-    "markdown_fit",
     "html_cleaned",
     "html_raw",
     "screenshot",
@@ -90,22 +88,48 @@ SUPPORTED_EXTRACTS: tuple[str, ...] = (
 
 
 class PerceiveViewport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     width: int = Field(default=1920, ge=320, le=3840)
     height: int = Field(default=1080, ge=240, le=2160)
 
 
 class PerceiveAuth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     username: str = Field(min_length=1, max_length=256)
     password: str = Field(min_length=1, max_length=256)
 
 
 class PerceiveOptionsBase(BaseModel):
-    """Per-render options shared by /v2/perceive and the batch endpoint."""
+    """Per-render options shared by /v2/perceive and the batch endpoint.
 
-    model_config = ConfigDict(populate_by_name=True)
+    ``extra="forbid"``: an unknown key is a 422 naming the field, never a
+    silent no-op. The 2026-08-06 QA cycle filed 22 findings against a
+    ``content_only`` parameter this API never had, because the schema
+    silently swallowed it — an unknown key MUST fail loudly.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     outputs: list[OutputName] = Field(
         default_factory=lambda: ["markdown", "structured"]
+    )
+    only_main_content: bool = Field(
+        default=True,
+        description="When true (default), the markdown output and the "
+        "main_content extract strip site chrome (navigation, header, "
+        "footer, sidebars, cookie banners, hidden nodes) behind a "
+        "fidelity guard that falls back to the full page when stripping "
+        "would remove too much real content. When false, the full page "
+        "content is kept with no stripping.",
+    )
+    direct_download: bool = Field(
+        default=False,
+        description="When true, the response body IS the artifact bytes "
+        "(no second fetch to a signed URL). Requires exactly one "
+        "artifact-producing output. Not available on the batch endpoint "
+        "(use output_mode='zip' there).",
     )
     extract: list[ExtractName] = Field(default_factory=list)
     extraction_schema: Optional[dict[str, Any]] = Field(
@@ -180,8 +204,24 @@ class PerceiveResponse(BaseModel):
     url: str
     url_final: Optional[str] = None
     content_hash: Optional[str] = None
+    status_code: Optional[int] = Field(
+        default=None,
+        description="HTTP status of the final main-document response "
+        "(e.g. 200, 404). None when the engine could not observe it.",
+    )
     render_quality: Optional[float] = Field(
         default=None, description="0.0-1.0; populated by the F.7 scorer."
+    )
+    deductions: dict[str, float] = Field(
+        default_factory=dict,
+        description="Named render-quality deductions that fired for this "
+        "render (e.g. {'http_error': 0.7}). Empty on a clean render.",
+    )
+    options_echo: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Echo of the request options the server honoured "
+        "(secrets redacted to booleans), so a caller can verify what "
+        "was actually applied.",
     )
     cache_hit: bool = False
     outputs: dict[str, OutputArtifact] = Field(default_factory=dict)
@@ -209,7 +249,7 @@ class PerceiveBatchRequest(BaseModel):
     schema-level backstop above every plan limit.
     """
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     urls: list[str] = Field(min_length=1, max_length=1000)
     options: PerceiveOptionsBase = Field(default_factory=PerceiveOptionsBase)

@@ -33,7 +33,11 @@ from api.v2.schemas.perceive import (
     PerceiveRequest,
     PerceiveResponse,
 )
-from api.v2.handlers.perceive_status import _response_from_operation
+from api.v2.handlers.perceive_status import (
+    _response_from_operation,
+    stream_artifact,
+)
+from api.v2.schemas.perceive import ARTIFACT_OUTPUTS
 from monitoring.metrics import log_activity_start, update_activity_status
 from services.v2_engine import batch_store, batch_worker, operations, perceive_flow
 from utils.error_capture import error_fields
@@ -67,12 +71,34 @@ def _reject_unsupported(body: PerceiveOptionsBase) -> None:
         )
 
 
+def _validate_direct_download(body: PerceiveRequest) -> None:
+    """direct_download streams ONE artifact as the body — enforce that
+    exactly one artifact-producing output was requested, with a message
+    that names what to change (fix E, QA report 2026-08-06)."""
+    if not body.direct_download:
+        return
+    artifact_outputs = [o for o in body.outputs if o in ARTIFACT_OUTPUTS]
+    if len(artifact_outputs) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="direct_download requires exactly one artifact output "
+            f"(you requested {body.outputs!r}). Pick one of "
+            f"{list(ARTIFACT_OUTPUTS)!r}, or drop direct_download to get "
+            "signed URLs for multiple outputs.",
+        )
+
+
 @router.post("/perceive", response_model=PerceiveResponse)
 async def perceive(
     body: PerceiveRequest,
     user: dict = Depends(get_current_user),
-) -> PerceiveResponse:
-    """Single-URL perception: render once, return every requested output."""
+):
+    """Single-URL perception: render once, return every requested output.
+
+    With ``direct_download=true`` the response body IS the artifact bytes
+    (metadata rides in X- headers) — no second fetch to a signed URL.
+    """
+    _validate_direct_download(body)
     check_v2_quota(user, "perceive_operations")
     _reject_unsupported(body)
     validate_auth_cookies_headers(
@@ -149,7 +175,10 @@ async def perceive(
         "render_quality_score": response.render_quality,
         "cache_hit": response.cache_hit,
         "output_file_size_bytes": total_bytes,
+        "direct_download": body.direct_download,
     }, source=posthog_client.source_from(user))
+    if body.direct_download:
+        return await stream_artifact(response)
     return response
 
 
@@ -179,6 +208,15 @@ async def perceive_batch(
             ],
         ) from exc
 
+    if body.options.direct_download:
+        raise HTTPException(
+            status_code=422,
+            detail="direct_download is not available on the batch "
+            "endpoint — a batch has many artifacts. Use "
+            "output_mode='zip' and download the archive, or fetch "
+            "individual results via GET /v2/perceive/{operation_id}"
+            "?direct_download=true.",
+        )
     check_batch_limit(user, len(requests))
     check_v2_quota(user, "perceive_operations", units=len(requests))
     _reject_unsupported(body.options)
@@ -234,9 +272,14 @@ async def perceive_batch(
 )
 async def perceive_batch_status(
     job_id: str,
+    direct_download: bool = False,
     user: dict = Depends(get_current_user),
-) -> PerceiveBatchResponse:
-    """Aggregate one batch from its operation rows (project-scoped 404)."""
+):
+    """Aggregate one batch from its operation rows (project-scoped 404).
+
+    ``?direct_download=true`` streams the batch ZIP archive directly
+    (only for output_mode='zip' batches whose archive is ready).
+    """
     project_id = int(user["id"])
     rows = operations.list_batch_operations(job_id, project_id)
     if not rows:
@@ -244,6 +287,40 @@ async def perceive_batch_status(
 
     items = [_response_from_operation(row) for row in rows]
     zip_artifact = _zip_artifact_from_rows(rows, user["id"])
+
+    if direct_download:
+        if zip_artifact is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No ZIP archive to download for this batch. "
+                "direct_download works on output_mode='zip' batches once "
+                "the archive is built; poll without direct_download for "
+                "per-URL results.",
+            )
+        import asyncio as _asyncio
+
+        from utils.storage import download_from_storage
+
+        try:
+            payload = await _asyncio.to_thread(
+                download_from_storage, zip_artifact.object_key
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=410,
+                detail="The batch archive is no longer in storage (it may "
+                "have passed your plan's file-retention window).",
+            ) from exc
+        filename = zip_artifact.object_key.rsplit("/", 1)[-1]
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(payload)),
+                "X-Job-Id": job_id,
+            },
+        )
     # The durable batch row is authoritative for output_mode and for the
     # 'canceled' terminal state (which the per-URL rows cannot express).
     batch = batch_store.get_batch_for_project(job_id, project_id)

@@ -9,6 +9,7 @@ load_dotenv()
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from api.v1.router import router as v1_router
 from api.v2.router import router as v2_router
@@ -255,6 +256,60 @@ async def health_check():
     return JSONResponse(
         status_code=200 if all_healthy else 503,
         content=content,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """Human-readable 422s (2026-08-06 QA report, fix A1 companion).
+
+    Every schema violation names exactly where the caller went wrong:
+    the field path, what was sent, and what would have been valid.
+    Unknown keys get an explicit "unknown parameter" message — the QA
+    cycle burned 22 tests on a parameter that was silently dropped, so
+    a wrong key must never look like an accepted one. The raw pydantic
+    ``detail`` list is kept for clients that already parse it.
+    """
+
+    def _path(loc: tuple) -> str:
+        parts: list[str] = []
+        for item in loc:
+            if isinstance(item, int):
+                parts.append(f"[{item}]")
+            else:
+                parts.append(f".{item}" if parts else str(item))
+        return "".join(parts) or "body"
+
+    detail: list[dict] = []
+    messages: list[str] = []
+    for error in exc.errors():
+        loc = tuple(error.get("loc", ()))
+        path = _path(loc)
+        err_type = error.get("type", "")
+        msg = error.get("msg", "invalid value")
+        sent = error.get("input", None)
+        if err_type == "extra_forbidden":
+            field = loc[-1] if loc else "?"
+            message = (
+                f"{path}: unknown parameter '{field}'. It is not part of "
+                "this endpoint's request schema and was rejected (unknown "
+                "keys are never silently ignored). Check the endpoint "
+                "documentation at https://enconvert.com/docs for the "
+                "accepted parameters."
+            )
+        elif err_type == "missing":
+            message = f"{path}: required parameter is missing."
+        else:
+            message = f"{path}: {msg}."
+            if sent is not None and not isinstance(sent, (dict, list)):
+                sent_repr = repr(sent)
+                if len(sent_repr) <= 120:
+                    message = f"{path}: {msg} (you sent {sent_repr})."
+        messages.append(message)
+        detail.append({"loc": list(loc), "msg": msg, "type": err_type})
+    return JSONResponse(
+        status_code=422,
+        content={"detail": detail, "errors": messages},
     )
 
 

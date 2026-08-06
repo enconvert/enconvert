@@ -66,19 +66,28 @@ def scrap_html(url: str, html: str) -> ScrapingResult:
     )
 
 
-def generate_markdown_bytes(html: str, base_url: str) -> bytes:
+def generate_markdown_bytes(
+    html: str, base_url: str, *, images_to_alt: bool = False
+) -> bytes:
     """Standard Markdown for the ``markdown`` output.
 
     Uses ``DefaultMarkdownGenerator`` over the (cleaned) HTML the caller
     provides. ``content_source`` is irrelevant in standalone mode — the
     ``input_html`` argument IS the source.
+
+    ``images_to_alt`` (QA report fix B5): render each image as its alt
+    text instead of an inline ``![alt](url)`` — a Next.js image CDN URL
+    is routinely 120+ characters of pure token bloat, and the full image
+    list stays available via ``outputs=["images"]``. Applied on the
+    only-main-content path; the full-content path keeps inline URLs.
     """
     if not html or not isinstance(html, str):
         return b""
     try:
-        generated = DefaultMarkdownGenerator().generate_markdown(
-            input_html=html, base_url=base_url
-        )
+        options = {"images_to_alt": True} if images_to_alt else None
+        generated = DefaultMarkdownGenerator(
+            options=options
+        ).generate_markdown(input_html=html, base_url=base_url)
         return (generated.raw_markdown or "").encode("utf-8")
     except Exception as exc:  # noqa: BLE001 — output must degrade, not 500
         logger.warning("markdown generation failed for %s: %s", base_url, exc)
