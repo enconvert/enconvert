@@ -244,13 +244,32 @@ def fail_job(job_id: str, error_message: str) -> bool:
     )
 
 
-def set_pages_discovered(job_id: str, count: int) -> None:
+def set_pages_discovered(
+    job_id: str,
+    count: int,
+    *,
+    pages_found: Optional[int] = None,
+    truncated: Optional[bool] = None,
+) -> None:
     """Record how many URLs the discovery phase enqueued.
+
+    ``pages_found`` / ``truncated`` (migration 026) carry the PRE-cap
+    discovery stats; omitted (None) they are left untouched, so the resume
+    path — which re-derives ``count`` from the page rows — never wipes the
+    stats the original discovery pass wrote.
 
     Guarded to active jobs (conditional UPDATE) so a cancel committed during
     discovery is never mutated back — audit counters on a terminal row stay
     frozen.
     """
+    values: dict[str, Any] = {
+        "pages_discovered": count,
+        "updated_at": _utcnow(),
+    }
+    if pages_found is not None:
+        values["pages_found"] = pages_found
+    if truncated is not None:
+        values["discovery_truncated"] = truncated
     db = get_db()
     try:
         db.execute(
@@ -259,7 +278,7 @@ def set_pages_discovered(job_id: str, count: int) -> None:
                 IngestJob.job_id == job_id,
                 IngestJob.status.in_(ACTIVE_JOB_STATUSES),  # type: ignore[attr-defined]
             )
-            .values(pages_discovered=count, updated_at=_utcnow())
+            .values(**values)
         )
         db.commit()
     finally:

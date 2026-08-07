@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from bs4 import BeautifulSoup
 
@@ -65,6 +66,7 @@ BOILERPLATE_TAGS: tuple[str, ...] = (
     "template",
     "iframe",
 )
+
 
 # B2 — div-soup boilerplate. Roles first (spec-defined, lowest false-positive
 # risk), then the class/id vocabulary the corpus actually uses. Every entry
@@ -125,12 +127,23 @@ MIN_RETAINED_RATIO: float = 0.45
 
 @dataclass(frozen=True)
 class MainContentResult:
-    """Outcome of one main-content strip."""
+    """Outcome of one main-content strip.
+
+    ``html`` keeps its original contract: the stripped page on success, the
+    ORIGINAL page when the guard aborted (callers that only read ``html``
+    are unaffected by an abort). ``stripped_html`` additionally carries the
+    strip output even when the guard fired, so the ensemble can let an
+    aborted strip COMPETE under the election's stricter prose-retention
+    floor instead of discarding it outright (the Pinecone/Mintlify fix:
+    on link-dense pages every legitimate strip trips the word-count guard,
+    yet retains all the page's prose).
+    """
 
     html: str
     aborted: bool
     words_before: int
     words_after: int
+    stripped_html: str = ""
 
 
 def _visible_word_count(soup: BeautifulSoup) -> int:
@@ -149,9 +162,11 @@ def extract_main_content(html: str) -> MainContentResult:
 
     Returns the stripped HTML, or the ORIGINAL html with ``aborted=True``
     when stripping would delete more than ``1 - MIN_RETAINED_RATIO`` of
-    the page's visible words. Never raises: any parse failure degrades to
-    the original HTML (an un-stripped page is a quality issue, a lost
-    page is an incident).
+    the page's visible words. An article's own title block (link-poor
+    ``<header>`` inside ``<main>``/``<article>``) is protected — see
+    ``_protected_article_header``. Never raises: any parse failure
+    degrades to the original HTML (an un-stripped page is a quality
+    issue, a lost page is an incident).
     """
     if not html or not isinstance(html, str):
         return MainContentResult(html=html or "", aborted=False,
@@ -163,19 +178,37 @@ def extract_main_content(html: str) -> MainContentResult:
         # B6 first: hidden nodes are junk regardless of what they are, and
         # removing them BEFORE the guard keeps font-probe filler ("word
         # word word…") from inflating the retained-word denominator.
+        # ``find_all`` materializes its result list up front, so when a
+        # hidden ancestor is decomposed here its (also-matched) descendants
+        # stay in the list as dead nodes with ``attrs=None`` — calling
+        # ``.get`` on one raised AttributeError and silently degraded the
+        # WHOLE strip to the original page (observed on figma.com, whose
+        # chrome nests style-hidden nodes). Skip already-decomposed tags.
         for tag in base_soup.find_all(style=True):
-            if _style_hides(tag.get("style") or ""):
+            if tag.decomposed:
+                continue
+            if _style_hides(tag.get("style") or "") and not _contains_content_region(tag):
                 tag.decompose()
 
-        # B1 — semantic tags.
+        # B1 — semantic tags. An article's own title block (link-poor
+        # <header> inside <main>/<article>) is content, not chrome — see
+        # _protected_article_header.
         for tag_name in BOILERPLATE_TAGS:
             for tag in base_soup.find_all(tag_name):
+                if tag_name == "header" and _protected_article_header(tag):
+                    continue
                 tag.decompose()
 
         # B2 — role/class/id selectors. soupsieve raises on a bad selector;
         # the list above is static and covered by tests, but guard anyway.
+        # Same decompose-while-iterating hazard as the B6 loop: ``select``
+        # materializes its list, so skip nodes a matched ancestor already
+        # took down. Nodes that CONTAIN the content region (streaming-SSR
+        # hidden wrappers) are never removed — see _contains_content_region.
         try:
             for tag in base_soup.select(BOILERPLATE_SELECTORS):
+                if tag.decomposed or _contains_content_region(tag):
+                    continue
                 tag.decompose()
         except Exception:  # noqa: BLE001 — selector engine failure
             logger.warning("boilerplate selector pass failed", exc_info=True)
@@ -189,17 +222,175 @@ def extract_main_content(html: str) -> MainContentResult:
                 aborted=True,
                 words_before=words_before,
                 words_after=words_after,
+                stripped_html=stripped,
             )
         return MainContentResult(
             html=stripped,
             aborted=False,
             words_before=words_before,
             words_after=words_after,
+            stripped_html=stripped,
         )
     except Exception:  # noqa: BLE001 — extraction must degrade, never 500
         logger.warning("main-content extraction failed", exc_info=True)
         return MainContentResult(html=html, aborted=False,
-                                 words_before=0, words_after=0)
+                                 words_before=0, words_after=0,
+                                 stripped_html=html)
+
+
+# Minimum visible words for a semantic main region to be worth proposing
+# as a candidate — below this the region is a stub (an empty SPA <main>
+# shell) and would only lose the election anyway.
+_MIN_REGION_WORDS: int = 10
+
+# High-confidence chrome, excluded from the retention BASELINE (not from
+# any candidate): hidden nodes plus spec-defined navigation containers.
+# A page's real content never legitimately lives in these, so removing
+# them from the baseline cannot mask content loss — while leaving them in
+# poisoned the floor with chrome prose (mega-menu product blurbs, hidden
+# search-dialog code snippets, announcement banners) that no clean
+# extraction can retain.
+_BASELINE_CHROME_SELECTORS: tuple[str, ...] = (
+    "[hidden]",
+    "[aria-hidden=true]",
+    "nav",
+    "header",
+    "footer",
+    "[role=navigation]",
+    "[role=banner]",
+    "[role=contentinfo]",
+)
+
+
+def _inside_main_region(tag: Any) -> bool:
+    """True when ``tag`` sits inside the page's semantic content region."""
+    try:
+        if tag.find_parent(("main", "article")) is not None:
+            return True
+        return tag.find_parent(attrs={"role": "main"}) is not None
+    except Exception:  # noqa: BLE001 — treat as chrome on any parse quirk
+        return False
+
+
+def _contains_content_region(tag: Any) -> bool:
+    """True when ``tag`` CONTAINS the page's semantic content region.
+
+    Streaming-SSR frameworks (Next.js) deliver the whole app inside a
+    ``<div hidden id="S:0">`` placeholder that client JS un-hides; on a
+    non-hydrated snapshot (TLS-engine fetch of platform.claude.com) that
+    wrapper is "hidden" yet holds the entire article. A hidden node that
+    contains ``<main>``/``<article>``/``[role=main]`` is therefore never
+    junk — deleting it deletes the page. Real chrome (cookie banners,
+    mega-menus, sidebars) never wraps the content region.
+    """
+    try:
+        if tag.find("main") is not None or tag.find("article") is not None:
+            return True
+        return tag.find(attrs={"role": "main"}) is not None
+    except Exception:  # noqa: BLE001 — keep the node when in doubt
+        return True
+
+
+# An in-main <header> counts as the ARTICLE's title block only when it is
+# link-poor — a title + intro carries at most a couple of anchor links,
+# while a site mega-header nested inside a page-wide <main> wrapper
+# carries dozens.
+_ARTICLE_HEADER_MAX_LINKS: int = 4
+
+
+def _protected_article_header(tag: Any) -> bool:
+    """True for a ``<header>`` that is an article's own title block.
+
+    Mintlify-style docs put the page h1 + intro paragraph in a
+    ``<header>`` INSIDE ``<main>`` — deleting it deletes the article's
+    opening. Protection requires all three: it is a ``header`` tag, it
+    sits inside the semantic main region, and it is link-poor (so a
+    site-wide header nested in a page-spanning ``<main>`` wrapper is
+    still treated as chrome).
+    """
+    try:
+        if getattr(tag, "name", None) != "header":
+            return False
+        if not _inside_main_region(tag):
+            return False
+        return len(tag.find_all("a")) <= _ARTICLE_HEADER_MAX_LINKS
+    except Exception:  # noqa: BLE001 — treat as chrome on any parse quirk
+        return False
+
+
+def guard_baseline_html(html: str) -> str:
+    """The page as a reader sees it, minus declared navigation chrome.
+
+    This is the retention-floor BASELINE for the ensemble: candidates are
+    scored on how much of THIS prose they keep. It is never returned to a
+    caller — the full page remains the fallback output. Chrome containers
+    nested inside the semantic main region are KEPT (see
+    ``_inside_main_region``), so deleting an article's own header can
+    never be masked by the baseline. Degrades to the original html on any
+    parse failure.
+    """
+    if not html or not isinstance(html, str):
+        return html or ""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup.find_all(style=True):
+            if tag.decomposed:
+                continue
+            if _style_hides(tag.get("style") or "") and not _contains_content_region(tag):
+                tag.decompose()
+        for selector in _BASELINE_CHROME_SELECTORS:
+            for tag in soup.select(selector):
+                if tag.decomposed or _protected_article_header(tag):
+                    continue
+                if _contains_content_region(tag):
+                    continue
+                tag.decompose()
+        return str(soup)
+    except Exception:  # noqa: BLE001 — baseline must degrade, never 500
+        logger.warning("guard-baseline extraction failed", exc_info=True)
+        return html
+
+
+def extract_main_region(html: str) -> str | None:
+    """The page's semantic main region (``<main>``/``[role=main]``/``<article>``).
+
+    A POSITIVE-selection counterpart to the negative strip above: on pages
+    whose chrome dwarfs the prose (docs sidebars, marketing mega-menus,
+    footer link farms) the strip's word-count guard aborts, but the page
+    itself already labels its content region. Returns the serialized
+    region, or None when the page declares none (callers then simply do
+    not get this candidate — behavior identical to before this fix).
+
+    When several regions match (blog-index ``<article>`` cards), the
+    wordiest one is proposed; the ensemble's prose-retention floor rejects
+    it if it is not actually the page's content.
+    """
+    if not html or not isinstance(html, str):
+        return None
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup(("script", "style", "noscript", "template")):
+            tag.decompose()
+        # Pool ALL region markers and take the wordiest: on
+        # platform.claude.com the <main> is a 121-word scroll-shell while
+        # the real article is an <article> SIBLING of it — a tag-priority
+        # order would lock onto the shell. When regions nest (article
+        # inside main) the outermost is wordiest and wins, which is the
+        # safe direction.
+        nodes = list(soup.find_all(("main", "article")))
+        nodes.extend(soup.select("[role=main]"))
+        best = None
+        best_words = 0
+        for node in nodes:
+            words = len(node.get_text(" ").split())
+            if words > best_words:
+                best, best_words = node, words
+        if best is None or best_words < _MIN_REGION_WORDS:
+            return None
+        return str(best)
+    except Exception:  # noqa: BLE001 — a missing candidate, never an error
+        logger.warning("main-region extraction failed", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -352,21 +543,38 @@ def _code_block_retention(
     return retained / len(baseline_blocks)
 
 
+def _nav_line_count(lines: list[str]) -> int:
+    """Absolute count of pure link-chrome lines (see ``_is_nav_line``)."""
+    return sum(1 for line in lines if _is_nav_line(line))
+
+
 def select_main_content(
     candidates: list[ContentCandidate],
     full_page_markdown: str,
+    baseline_markdown: str | None = None,
 ) -> SelectedContent:
     """Pick the cleanest candidate that keeps the page's real content.
 
-    ``full_page_markdown`` is both the retention baseline AND the final
-    fallback: it is always eligible (retention 1.0 by construction), so
-    the ensemble can never return less content than the page has — an
-    over-aggressive extractor loses the election instead of shipping a
-    stub. Selection: among candidates retaining >= RETENTION_FLOOR of
-    the baseline's prose words, minimise nav-chrome ratio; ties go to
-    the shorter text.
+    ``full_page_markdown`` is the final fallback: it is always eligible
+    (retention 1.0 by construction), so the ensemble can never return
+    less content than the page has — an over-aggressive extractor loses
+    the election instead of shipping a stub.
+
+    ``baseline_markdown`` (optional) is the retention yardstick — the
+    markdown of the VISIBLE, chrome-free page (``guard_baseline_html``).
+    When omitted, the full page doubles as the baseline (the original
+    behavior, kept for callers/tests that pass two arguments).
+
+    Selection: among candidates retaining >= RETENTION_FLOOR of the
+    baseline's prose words (and its code blocks), minimise the ABSOLUTE
+    number of nav-chrome lines; ties go to the shorter text. The count
+    (not the ratio) is deliberate: on link-hub pages whose content IS
+    links, stripping non-link chrome (footer taglines, search boxes)
+    RAISED the ratio and handed the election to the unstripped page.
     """
-    baseline_lines = _lines(full_page_markdown)
+    baseline_lines = _lines(
+        baseline_markdown if baseline_markdown else full_page_markdown
+    )
     baseline_words = _prose_words(baseline_lines)
     baseline_blocks = _code_blocks(baseline_lines)
 
@@ -396,17 +604,23 @@ def select_main_content(
             )
         )
 
+    full_page_lines = _lines(full_page_markdown)
     full_page = SelectedContent(
         markdown=full_page_markdown,
         source="full_page",
         retention=1.0,
-        nav_ratio=_nav_ratio(baseline_lines),
+        nav_ratio=_nav_ratio(full_page_lines),
         fell_back_to_full_page=True,
     )
 
     if len(baseline_words) < _MIN_BASELINE_WORDS:
         # Too little prose to score against; prefer the structural strip
         # (its own fidelity guard already ran) over an unscoreable vote.
+        # main_region and the unguarded (aborted-strip) candidate are
+        # deliberately NOT trusted here — with no baseline to score
+        # retention against, nothing would catch a region that is really
+        # a nav shell (observed on platform.claude.com before the
+        # streaming-SSR baseline fix).
         for entry in scored:
             if entry.source == "structural":
                 return entry
@@ -414,5 +628,8 @@ def select_main_content(
 
     eligible = [e for e in scored if e.retention >= RETENTION_FLOOR]
     eligible.append(full_page)
-    winner = min(eligible, key=lambda e: (e.nav_ratio, len(e.markdown)))
+    winner = min(
+        eligible,
+        key=lambda e: (_nav_line_count(_lines(e.markdown)), len(e.markdown)),
+    )
     return winner

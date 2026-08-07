@@ -44,6 +44,7 @@ import os
 import tempfile
 from collections import Counter
 from typing import Any, BinaryIO, List, Optional
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from fastapi import HTTPException
@@ -177,25 +178,75 @@ def _markdown_for(html: str, base_url: str) -> str:
 # ── Discovery ────────────────────────────────────────────────────────────────
 
 
-async def _discover_urls(job: IngestJob, discovery: dict[str, Any], user: dict) -> List[str]:
-    """Resolve the ordered, de-duplicated URL list to ingest.
+# Schema ceiling on DiscoverRequest.max_urls — the sitemap probe asks for
+# this instead of max_pages so pages_found reports the site's TRUE unique
+# URL count (sitemap parsing is pure HTTP; nothing extra is fetched).
+_SITEMAP_PROBE_MAX_URLS = 1000
+
+
+def _fold_www_duplicates(urls: List[str]) -> List[str]:
+    """Drop URLs that differ from an earlier one only by a ``www.`` host
+    prefix (or a trailing slash).
+
+    Discovery seeds the map with the request URL, so an apex seed plus a
+    www-canonical sitemap yields the same homepage twice (live QA:
+    enconvert.com ingested ``https://enconvert.com/`` AND
+    ``https://www.enconvert.com/`` as two pages). First occurrence wins;
+    the render follows redirects, so keeping either variant is correct.
+    """
+    seen: set[str] = set()
+    out: List[str] = []
+    for url in urls:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        folded_host = host[4:] if host.startswith("www.") else host
+        key = f"{folded_host}|{parts.path.rstrip('/')}|{parts.query}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(url)
+    return out
+
+
+async def _discover_urls(
+    job: IngestJob, discovery: dict[str, Any], user: dict
+) -> tuple[List[str], Optional[int], bool]:
+    """Resolve the URL list to ingest, plus honest discovery stats.
+
+    Returns ``(urls, pages_found, truncated)``:
+
+    * ``urls`` — the ordered, de-duplicated, ``max_pages``-capped list the
+      job will actually process (drives ``pages_discovered``, unchanged
+      semantics);
+    * ``pages_found`` — unique eligible URLs discovery yielded BEFORE the
+      cap (sitemap: true unique count up to the schema ceiling; crawl:
+      bounded by the crawl budget; None for explicit-urls mode);
+    * ``truncated`` — True when at least one more unique URL existed past
+      the cap/budget (drives the response warning).
 
     ``urls`` mode returns the explicit list; ``sitemap``/``crawl`` run
-    ``discover_flow`` (which SSRF-screens the seed and raises HTTPException on a
-    private/blocked host) and cap the result at ``max_pages``.
+    ``discover_flow`` (which SSRF-screens the seed and raises HTTPException
+    on a private/blocked host).
     """
     max_pages = int(discovery.get("max_pages", 50))
     if job.mode == "urls":
         # Explicit list: de-dup order-preserving; the schema already bounds
         # the count, so max_pages (a discovery knob) does not apply here.
-        return list(dict.fromkeys(job.source_urls or []))
+        explicit = list(dict.fromkeys(job.source_urls or []))
+        return explicit, None, False
 
     from services.v2_engine import discover_flow
 
+    # Sitemap probing is pure HTTP over already-parsed sitemap files, so ask
+    # for the schema ceiling to learn the site's real size; crawl fetches a
+    # page per URL, so its probe stays at max_pages (the fetch budget).
+    probe_max = (
+        _SITEMAP_PROBE_MAX_URLS if job.mode == "sitemap" else max_pages
+    )
     discover_request = DiscoverRequest(
         url=job.source_url or "",
         mode=job.mode,  # "sitemap" | "crawl"
-        max_urls=max_pages,
+        max_urls=probe_max,
         max_depth=int(discovery.get("max_depth", 2)),
         same_domain_only=bool(discovery.get("same_domain_only", True)),
         include_patterns=list(discovery.get("include_patterns", [])),
@@ -203,7 +254,10 @@ async def _discover_urls(job: IngestJob, discovery: dict[str, Any], user: dict) 
         respect_robots=bool(discovery.get("respect_robots", False)),
     )
     result = await discover_flow.run(discover_request, user)
-    return list(dict.fromkeys(result.urls))[:max_pages]
+    unique = _fold_www_duplicates(list(dict.fromkeys(result.urls)))
+    urls = unique[:max_pages]
+    truncated = bool(result.truncated) or len(unique) > len(urls)
+    return urls, len(unique), truncated
 
 
 # ── Per-page processing ──────────────────────────────────────────────────────
@@ -346,7 +400,9 @@ async def process_job(job_id: str) -> None:
         ):
             return  # canceled or already advanced by another path
         try:
-            urls = await _discover_urls(job, discovery_cfg, user)
+            urls, pages_found, truncated = await _discover_urls(
+                job, discovery_cfg, user
+            )
         except HTTPException as exc:
             await asyncio.to_thread(
                 ingest_store.fail_job, job_id, f"discovery rejected: {exc.detail}"
@@ -368,9 +424,18 @@ async def process_job(job_id: str) -> None:
             )
             return
         await asyncio.to_thread(ingest_store.create_pages, job_id, urls)
-        await asyncio.to_thread(ingest_store.set_pages_discovered, job_id, len(urls))
+        await asyncio.to_thread(
+            ingest_store.set_pages_discovered,
+            job_id,
+            len(urls),
+            pages_found=pages_found,
+            truncated=truncated,
+        )
         pages = await asyncio.to_thread(ingest_store.list_pages, job_id)
     else:
+        # Resume: the page rows are authoritative; leave the migration-026
+        # discovery stats untouched (they were written by the original
+        # discovery pass).
         await asyncio.to_thread(
             ingest_store.set_pages_discovered, job_id, len(pages)
         )
@@ -764,15 +829,45 @@ def _signed_output_url(job: IngestJob) -> Optional[str]:
     return None
 
 
+def _truncation_warning(job: IngestJob) -> Optional[str]:
+    """Human-readable truncation note (migration 026 stats), or None.
+
+    Central so POST, GET and the MCP passthrough all explain the
+    pages_found vs pages_discovered gap — the live-QA complaint was a
+    719-URL sitemap silently reported as "pages_discovered: 50".
+    """
+    found = getattr(job, "pages_found", None)
+    if found is not None and found > (job.pages_discovered or 0):
+        discovery = (job.chunk_options or {}).get("discovery", {})
+        cap = discovery.get("max_pages", 50)
+        return (
+            f"discovery found {found} unique URLs; the job was capped at "
+            f"max_pages={cap}, so {job.pages_discovered} pages were "
+            "enqueued. Raise max_pages to ingest more of the site."
+        )
+    if getattr(job, "discovery_truncated", False):
+        return (
+            "discovery stopped at the max_pages cap; the site has more "
+            "URLs than this job enqueued. Raise max_pages to ingest more."
+        )
+    return None
+
+
 def job_response(
     job: IngestJob, *, warnings: Optional[List[str]] = None
 ) -> IngestJobResponse:
     """Build the API view of a job, signing the output URL when present."""
+    combined = list(warnings or [])
+    note = _truncation_warning(job)
+    if note is not None:
+        combined.append(note)
     return IngestJobResponse(
         job_id=job.job_id,
         status=job.status,  # type: ignore[arg-type]
         mode=job.mode,  # type: ignore[arg-type]
         pages_discovered=job.pages_discovered,
+        pages_found=getattr(job, "pages_found", None),
+        discovery_truncated=bool(getattr(job, "discovery_truncated", False)),
         pages_processed=job.pages_processed,
         pages_failed=job.pages_failed,
         total_chunks=job.total_chunks,
@@ -782,7 +877,7 @@ def job_response(
         webhook_delivered=job.webhook_delivered,
         created_at=job.created_at,
         completed_at=job.completed_at,
-        warnings=warnings or [],
+        warnings=combined,
     )
 
 
@@ -797,6 +892,8 @@ def job_summary(job: IngestJob) -> IngestJobSummary:
         status=job.status,  # type: ignore[arg-type]
         mode=job.mode,  # type: ignore[arg-type]
         pages_discovered=job.pages_discovered,
+        pages_found=getattr(job, "pages_found", None),
+        discovery_truncated=bool(getattr(job, "discovery_truncated", False)),
         pages_processed=job.pages_processed,
         pages_failed=job.pages_failed,
         total_chunks=job.total_chunks,

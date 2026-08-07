@@ -4,6 +4,7 @@ Sends emails using Brevo API.
 """
 import html
 import os
+import re
 import requests
 from typing import Optional, List, Dict
 import logging
@@ -11,16 +12,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
-SENDER_EMAIL = "noreply@enconvert.com"
-SENDER_NAME = "EnConvert"
 
-# Old SMTP config (kept for reference)
-# smtp_host = os.getenv("SMTP_HOST")
-# smtp_port = int(os.getenv("SMTP_PORT", 587))
-# smtp_username = os.getenv("SMTP_USERNAME")
-# smtp_password = os.getenv("SMTP_PASSWORD")
-# smtp_from_email = os.getenv("SMTP_FROM_EMAIL")
-# smtp_from_name = os.getenv("SMTP_FROM_NAME", "EnConvert")
+# ── Sender identity ─────────────────────────────────────────────
+# MAIL_FROM_EMAIL must live on a domain that is fully authenticated in Brevo
+# (brevo-code TXT + DKIM + DMARC). If the domain is not authenticated, Brevo
+# accepts the API call but silently rewrites the visible From header to an
+# address on its own shared domain (<local>@<account>.brevosend.com). No code
+# change can override that -- it is fixed in DNS, not here.
+MAIL_FROM_EMAIL = os.getenv("MAIL_FROM_EMAIL", "noreply@enconvert.com")
+MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "EnConvert")
+MAIL_REPLY_TO = os.getenv("MAIL_REPLY_TO", "support@enconvert.com")
 
 
 def send_job_completion_email(
@@ -40,18 +41,11 @@ def send_job_completion_email(
     try:
         html_content = _build_email_html(job_id, job_status, tasks, batch_id)
 
-        response = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "content-type": "application/json"},
-            json={
-                "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-                "to": [{"email": recipient_email}],
-                "subject": f"Job Completion: {job_status.upper()}",
-                "htmlContent": html_content,
-            },
-            timeout=(3.05, 10),
+        _send_brevo(
+            recipient_email,
+            f"Job Completion: {job_status.upper()}",
+            html_content,
         )
-        response.raise_for_status()
         logger.info(f"Job completion email sent to {recipient_email}")
         return True
 
@@ -79,18 +73,11 @@ def send_watcher_paused_email(
     try:
         html_content = _build_watcher_paused_html(watcher_id, url, error_message)
 
-        response = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "content-type": "application/json"},
-            json={
-                "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-                "to": [{"email": recipient_email}],
-                "subject": "Your EnConvert watcher was paused",
-                "htmlContent": html_content,
-            },
-            timeout=(3.05, 10),
+        _send_brevo(
+            recipient_email,
+            "Your EnConvert watcher was paused",
+            html_content,
         )
-        response.raise_for_status()
         # Log the watcher id, not the recipient address (email is PII).
         logger.info(f"Watcher paused email sent for watcher {watcher_id}")
         return True
@@ -181,18 +168,11 @@ def send_watcher_change_email(
         html_content = _build_watcher_change_html(
             url, similarity, changes, checked_at
         )
-        response = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "content-type": "application/json"},
-            json={
-                "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-                "to": [{"email": recipient_email}],
-                "subject": "Change detected on a page you are watching",
-                "htmlContent": html_content,
-            },
-            timeout=(3.05, 10),
+        _send_brevo(
+            recipient_email,
+            "Change detected on a page you are watching",
+            html_content,
         )
-        response.raise_for_status()
         logger.info(f"Watcher change email sent for watcher {watcher_id}")
         return True
 
@@ -444,18 +424,11 @@ def send_api_key_unauthorized_domain_email(
           </div>
         </body></html>
         """
-        response = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "content-type": "application/json"},
-            json={
-                "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-                "to": [{"email": recipient_email}],
-                "subject": "Unauthorized use of your EnConvert API key",
-                "htmlContent": html_content,
-            },
-            timeout=(3.05, 10),
+        _send_brevo(
+            recipient_email,
+            "Unauthorized use of your EnConvert API key",
+            html_content,
         )
-        response.raise_for_status()
         logger.info("Unauthorized-domain alert sent")
         return True
     except Exception as e:
@@ -496,18 +469,11 @@ def send_quota_reached_email(
           </div>
         </body></html>
         """
-        response = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": BREVO_API_KEY, "content-type": "application/json"},
-            json={
-                "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-                "to": [{"email": recipient_email}],
-                "subject": "You've hit your monthly conversion limit – EnConvert",
-                "htmlContent": html_content,
-            },
-            timeout=(3.05, 10),
+        _send_brevo(
+            recipient_email,
+            "You've hit your monthly conversion limit – EnConvert",
+            html_content,
         )
-        response.raise_for_status()
         logger.info("Quota-reached alert sent")
         return True
     except Exception as e:
@@ -525,16 +491,38 @@ def send_quota_reached_email(
 # ---------------------------------------------------------------------------
 
 
+def _plain_text(html_body: str) -> str:
+    """Crude HTML -> text fallback for the multipart alternative.
+
+    An HTML-only body with no text/plain part is a well-known spam signal, and
+    Brevo only builds the alternative part if we supply ``textContent``.
+    """
+    text = re.sub(r"(?is)<(script|style).*?</\1>", "", html_body)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</h[1-6]>|</tr>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
 def _send_brevo(recipient_email: str, subject: str, html_content: str) -> bool:
-    """POST one transactional email to Brevo. Shared by the senders below."""
+    """POST one transactional email to Brevo.
+
+    The single egress point for every email the gateway sends, so the sender
+    identity is defined in exactly one place. Raises on transport/HTTP error;
+    each caller wraps this in its own try/except and returns False.
+    """
     response = requests.post(
         "https://api.brevo.com/v3/smtp/email",
         headers={"api-key": BREVO_API_KEY, "content-type": "application/json"},
         json={
-            "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+            "sender": {"name": MAIL_FROM_NAME, "email": MAIL_FROM_EMAIL},
+            "replyTo": {"name": MAIL_FROM_NAME, "email": MAIL_REPLY_TO},
             "to": [{"email": recipient_email}],
             "subject": subject,
             "htmlContent": html_content,
+            "textContent": _plain_text(html_content),
         },
         timeout=(3.05, 10),
     )

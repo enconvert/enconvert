@@ -693,6 +693,12 @@ class IngestJob(SQLModel, table=True):
     chunk_options: Optional[dict] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     status: str = Field(default="queued", max_length=20)
     pages_discovered: int = 0
+    # Migration 026: unique URLs discovery yielded BEFORE the max_pages cap
+    # (sitemap: true unique count; crawl: bounded by the crawl budget, so
+    # "at least"). NULL on legacy rows and urls-mode jobs.
+    pages_found: Optional[int] = None
+    # Migration 026: at least one more unique URL existed past the cap.
+    discovery_truncated: bool = False
     pages_processed: int = 0
     pages_failed: int = 0
     total_chunks: int = 0

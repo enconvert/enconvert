@@ -199,6 +199,22 @@ class IngestJobResponse(BaseModel):
     status: IngestStatus
     mode: IngestMode
     pages_discovered: int = 0
+    pages_found: Optional[int] = Field(
+        default=None,
+        description=(
+            "Unique eligible URLs discovery yielded BEFORE the max_pages "
+            "cap (sitemap: true unique count; crawl: bounded by the crawl "
+            "budget, so a lower bound). Absent for explicit-urls jobs and "
+            "jobs created before migration 026."
+        ),
+    )
+    discovery_truncated: bool = Field(
+        default=False,
+        description=(
+            "True when discovery found more unique URLs than max_pages "
+            "allowed the job to enqueue."
+        ),
+    )
     pages_processed: int = 0
     pages_failed: int = 0
     total_chunks: int = 0
@@ -227,6 +243,8 @@ class IngestJobSummary(BaseModel):
     status: IngestStatus
     mode: IngestMode
     pages_discovered: int = 0
+    pages_found: Optional[int] = None
+    discovery_truncated: bool = False
     pages_processed: int = 0
     pages_failed: int = 0
     total_chunks: int = 0
