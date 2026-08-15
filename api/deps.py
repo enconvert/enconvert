@@ -393,11 +393,15 @@ def check_ops_quota(user: dict, units: int = 1):
 
     ``units`` is the number of ops this request will consume (1 per unit of
     work: per conversion/URL/page/query; batch submitters pre-check their
-    whole batch). The limit is the RESOLVED effective ops cap — the
+    whole batch). The base limit is the RESOLVED effective ops cap — the
     subscription dict already applies COALESCE(override_ops_month,
     NULLIF(effective_ops_month, 0), plan.ops_month) in
     utils.subscription.get_subscription — and a resolved 0 means unlimited
-    (enterprise/admin convention). Denials are 402: the remedy is always
+    (enterprise/admin convention). The period's one-time social-follow bonus
+    (migration 035) is ADDED to that base, giving the effective cap enforced
+    here; the same sum is re-derived in SQL by the overage subquery in
+    utils.usage_ledger._BUMP_OPS_TEMPLATE, so the gate and the money path
+    agree. Denials are 402: the remedy is always
     "upgrade". Every paid plan (Indie/Studio/Production) carries
     overage_allowed at $0.02 per op; a subscription that opted in
     (overage_enabled, off by default) passes the gate instead and is billed
@@ -428,8 +432,13 @@ def check_ops_quota(user: dict, units: int = 1):
     if sub.get("plan_slug") == "admin":
         return
 
-    limit = int(sub.get("effective_ops_month", 0) or 0)
-    if limit <= 0:
+    # ORDERING CONSTRAINT (migration 035): the unlimited short-circuit tests
+    # the BASE cap, before any bonus is folded in and before the usage-period
+    # read. A resolved 0 means unlimited, so 0 + bonus_ops would silently turn
+    # an unlimited account into a bonus_ops-sized HARD CAP; returning here also
+    # keeps the period read off the unlimited path entirely.
+    base_limit = int(sub.get("effective_ops_month", 0) or 0)
+    if base_limit <= 0:
         return  # 0 = unlimited (enterprise convention, migration 029)
 
     try:
@@ -460,6 +469,19 @@ def check_ops_quota(user: dict, units: int = 1):
                 detail="No active billing period found for this project. "
                        "Contact support to restore your subscription."
             )
+
+    # Effective cap for THIS period only: base + the one-time social-follow
+    # bonus credited to the period (migration 035; the rotation writes
+    # bonus_ops = 0 on every new period, so it never rolls over). Every
+    # comparison, message and analytics property below reads this bonused
+    # number — a user holding a 900-op effective cap must never be told
+    # "limit reached (500/500)".
+    #
+    # getattr, not plain attribute access: this gate runs on every request and
+    # accepts any period-shaped object, and a create_all-bootstrapped dev DB
+    # can still hold a pre-035 row that reads NULL here — neither may 500 the
+    # whole quota check over a bonus nobody claimed.
+    limit = base_limit + int(getattr(usage, "bonus_ops", 0) or 0)
 
     used = int(usage.ops_used or 0)
     if used + units <= limit:

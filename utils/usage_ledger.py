@@ -139,6 +139,21 @@ _INSERT_LEDGER_ROW = text(
 # lock); NOT atomic w.r.t. a concurrent plan-limit change — identical
 # tolerance to the pre-unified code.
 #
+# The period's one-time social-follow bonus (migration 035) is the final
+# additive term of that cap, and it MUST be added on the INSIDE of the
+# NULLIF, never before it: the NULLIF is what encodes "unlimited", and
+# folding the bonus in first would turn a resolved 0 into a real
+# bonus_ops-sized cap and start an unlimited project accruing overage
+# above it. NULL + bonus is NULL, and 0 (unlimited) is NULLed out before
+# the bonus is reached, so both unlimited shapes still reach the outer
+# COALESCE and still pin overage_ops at 0. bonus_ops is read from the
+# UPDATE's own row (qualified — a correlated subquery is in scope) and
+# COALESCEd because create_all-bootstrapped dev DBs can hold pre-035 rows
+# with no server default behind the column. This must stay in lockstep
+# with the Python gate (api.deps.check_ops_quota): if the gate lets bonus
+# ops through and this SQL does not, an opted-in paid user is billed
+# overage for operations the bonus already covered.
+#
 # {breakdown_set} is filled from the _BREAKDOWN_COLUMNS whitelist only —
 # never from caller input directly.
 _BUMP_OPS_TEMPLATE = """
@@ -153,7 +168,8 @@ _BUMP_OPS_TEMPLATE = """
                      FROM ch_subscriptions s
                      JOIN ch_plans p ON p.id = s.plan_id
                      WHERE s.project_id = ch_usage_periods.project_id),
-                    0),
+                    0)
+                + COALESCE(ch_usage_periods.bonus_ops, 0),
                 ops_used + :units),
             0),
         updated_at = :now

@@ -429,6 +429,25 @@ class UsagePeriod(SQLModel, table=True):
     # atomically at increment time.
     ops_used: int = 0
     overage_ops: int = 0
+    # Migration 035: ONE-TIME social-follow bonus, additive to the resolved
+    # plan cap for THIS period only. bonus_ops is the denormalized sum read by
+    # check_ops_quota (api/deps.py) and by the overage subquery in
+    # utils/usage_ledger._BUMP_OPS_TEMPLATE on every billable operation;
+    # bonus_ops_ids is the provenance — the ch_bonus_ops row ids that produced
+    # it (a BACKEND-owned table; the gateway never writes either column).
+    # Postgres cannot foreign-key array elements, so the verifiable reverse
+    # link is ch_bonus_ops.usage_period_id. NOT carried into the next period:
+    # services/billing_rotation._INSERT_PERIOD_IF_ABSENT writes 0 / '{}'
+    # explicitly, which is what makes the bonus one-time by construction.
+    bonus_ops: int = 0
+    bonus_ops_ids: List[int] = Field(
+        default_factory=list,
+        sa_column=Column(
+            ARRAY(BigInteger),
+            nullable=False,
+            server_default=text("'{}'::bigint[]"),
+        ),
+    )
     storage_bytes_peak: int = 0
     # Per-endpoint telemetry BREAKDOWNS of ops_used — not caps. Incremented
     # in the same atomic UPDATE that bumps ops_used.

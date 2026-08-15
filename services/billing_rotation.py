@@ -92,17 +92,23 @@ _worker_task: Optional[asyncio.Task] = None
 # period exists). Rows inserted earlier in the SAME transaction are visible
 # to later statements, so the multi-month catch-up walk in _rotate_sync
 # chains the carryover correctly period by period.
+#
+# bonus_ops / bonus_ops_ids (migration 035) are the deliberate OPPOSITE of the
+# ai-credit rollover above them: the social-follow bonus is granted ONCE, for
+# the period it was approved in, so every new period starts at 0 / '{}'.
+# Writing them explicitly here is what makes the bonus one-time by
+# construction — an omitted column would NULL on a create_all dev DB.
 _INSERT_PERIOD_IF_ABSENT = text(
     """
     INSERT INTO ch_usage_periods
         (project_id, period_start, period_end, plan_id,
-         ops_used, overage_ops, storage_bytes_peak,
+         ops_used, overage_ops, bonus_ops, bonus_ops_ids, storage_bytes_peak,
          conversions_used, perceive_operations, ingest_pages,
          lookup_queries, distill_operations,
          ai_credits_granted_cents, llm_cost_cents, created_at)
     SELECT
         :project_id, :period_start, :period_end, :plan_id,
-        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, '{}'::bigint[], 0, 0, 0, 0, 0, 0,
         COALESCE(
             (SELECT s.override_ai_credits_cents_month
              FROM ch_subscriptions s

@@ -11,9 +11,15 @@ re-assertions live in the candidate SQL so ineligible users never reach the
 claim path):
 
 - On the free plan (``ch_plans.slug = 'free'``) on an owned project whose
-  CURRENT usage period sits in the 50% band:
-  ``ops_used >= 0.5 * effective_ops_month AND ops_used < effective_ops_month``
-  with ``effective_ops_month > 0`` (0 = unlimited never qualifies).
+  CURRENT usage period sits in the 50% band of its EFFECTIVE cap —
+  ``effective_ops_month + up.bonus_ops``, the same sum the quota gate
+  enforces (migration 035) — with ``effective_ops_month > 0`` on the BASE
+  cap (0 = unlimited never qualifies; the bonus must not manufacture a cap
+  for an unlimited account). The bonus belongs in this denominator because
+  it materially moves the ceiling on exactly this population: a 250-op
+  follow bonus on the free plan more than triples it, and a user at 60/100
+  base is really at 60/350 — not "about to run out", so not a founder-call
+  candidate.
 - HAS NEVER PAID. Signal: no ``ch_payment_history`` row with
   ``status = 'COMPLETED'`` on any project the user OWNS. Chosen over a
   plan-slug check because ``ch_subscriptions`` holds only the CURRENT plan
@@ -101,7 +107,10 @@ _CANDIDATES = text(f"""
             m.project_id,
             up.ops_used,
             s.effective_ops_month,
-            (up.ops_used::float / s.effective_ops_month) AS ops_ratio,
+            COALESCE(up.bonus_ops, 0) AS bonus_ops,
+            (up.ops_used::float
+             / (s.effective_ops_month + COALESCE(up.bonus_ops, 0)))
+                AS ops_ratio,
             (SELECT COUNT(*) FROM ch_email_log el
               WHERE el.user_id = u.id
                 AND el.email_type = 'founder_call') AS prior_offers
@@ -116,9 +125,16 @@ _CANDIDATES = text(f"""
          AND CAST(:now AS timestamptz) <  up.period_end
         LEFT JOIN pg_timezone_names tz ON tz.name = u.timezone
         WHERE p.slug = 'free'
+          -- unlimited (0) is tested on the BASE cap, before the bonus:
+          -- 0 + bonus_ops is not a ceiling anyone is approaching.
           AND s.effective_ops_month > 0
+          -- Band over the EFFECTIVE cap (base + one-time follow bonus).
+          -- The lower bound is the distributed form of
+          -- BAND_LOW * (base + bonus) — '*' binds before '+'.
           AND up.ops_used >= {BAND_LOW} * s.effective_ops_month
+                             + {BAND_LOW} * COALESCE(up.bonus_ops, 0)
           AND up.ops_used <  s.effective_ops_month
+                             + COALESCE(up.bonus_ops, 0)
           -- never paid: no COMPLETED payment on any project the user owns
           AND NOT EXISTS (
               SELECT 1
@@ -173,7 +189,9 @@ _CANDIDATES = text(f"""
           AND u.lifecycle_opt_out_at IS NULL
           AND u.email_suppressed_at IS NULL
           AND u.created_at >= :epoch
-        ORDER BY u.id, (up.ops_used::float / s.effective_ops_month) DESC
+        ORDER BY u.id, (up.ops_used::float
+                        / (s.effective_ops_month
+                           + COALESCE(up.bonus_ops, 0))) DESC
     ) c
     ORDER BY c.ops_ratio DESC
     LIMIT :slots
@@ -197,9 +215,14 @@ def build_founder_call_candidate(
         return None
     if not row.get("is_email_verified"):
         return None
-    limit = int(row.get("effective_ops_month") or 0)
+    # Unlimited is decided on the BASE cap; the band then runs against the
+    # effective one (base + the period's one-time follow bonus), matching the
+    # candidate SQL and the quota gate. Rows without the key (older callers,
+    # unit tests) read as no bonus.
+    base_limit = int(row.get("effective_ops_month") or 0)
+    limit = base_limit + int(row.get("bonus_ops") or 0)
     used = int(row.get("ops_used") or 0)
-    if limit <= 0 or used < BAND_LOW * limit or used >= limit:
+    if base_limit <= 0 or used < BAND_LOW * limit or used >= limit:
         return None
     prior = int(row.get("prior_offers") or 0)
     if prior >= LIFETIME_OFFER_CAP:
