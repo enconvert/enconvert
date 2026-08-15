@@ -148,6 +148,19 @@ class User(SQLModel, table=True):
     active: bool = True
     banned_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
     banned_reason: Optional[str] = None
+    # Onboarding lifecycle state (migration 031). SCHEMA TWIN of
+    # backend/models.py User. All NULL = default-open; email_verified_at is
+    # NOT backfilled (is_email_verified stays the gating truth). Opt-out and
+    # suppression are checked in the lifecycle candidate layer ONLY, never
+    # inside _send/_send_brevo (transactional mail must still deliver).
+    email_verified_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    # IANA zone for send-window math; validated against pg_timezone_names.
+    timezone: Optional[str] = Field(default=None, max_length=64)
+    locale: Optional[str] = Field(default=None, max_length=10)
+    lifecycle_opt_out_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    email_suppressed_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    # 'hard_bounce' | 'spam' (Brevo webhook, app-set).
+    email_suppression_reason: Optional[str] = Field(default=None, max_length=40)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at: Optional[datetime] = None
 
@@ -178,6 +191,14 @@ class APIKeys(SQLModel, table=True):
     # Throttle for the "key used from an unauthorized domain" alert (migration
     # 009). SCHEMA TWIN of backend/models.py APIKeys.
     last_unauthorized_alert_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    # Key-usage stamps (migration 031), written here by the auth path when
+    # API_KEY_USAGE_STAMP_ENABLED. first_used_at = activation signal;
+    # last_used_at throttled via API_KEY_LAST_USED_THROTTLE_SECONDS.
+    # first_used_surface: web | api | sdk | mcp | extension | cli | n8n
+    # (source_from in monitoring/posthog_client.py).
+    first_used_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    last_used_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    first_used_surface: Optional[str] = Field(default=None, max_length=16)
 
 
 class Project(SQLModel, table=True):
@@ -264,7 +285,6 @@ class Plan(SQLModel, table=True):
     slug: str = Field(max_length=20, unique=True)
     name: str = Field(max_length=50)
     price_monthly: int = 0
-    conversion_limit: int = 100
     max_file_size: int = 5242880
     file_retention_hours: int = 1
     batch_limit: int = 0
@@ -279,19 +299,24 @@ class Plan(SQLModel, table=True):
     overage_rate_cents: float = 0
     overage_allowed: bool = False
     is_active: bool = True
-    # V2 plan gates + quotas (migration 011; per-slug defaults seeded by 012).
-    # V3 plan section 7 prose lists 11 columns, but its defaults table and the
-    # F.4 verification queries also require perceive_operations_month and
-    # distill_operations_month — 13 columns total.
+    # Unified ops counter (migration 029, 2026-08 pricing proposal): ONE flat
+    # ops-per-month cap across every endpoint (500/3,000/15,000/50,000;
+    # 0 = negotiated/unlimited). Replaces V1 conversion_limit and the four
+    # per-endpoint V2 *_month caps (dropped by migration 030). The *_enabled
+    # flags survive as kill-switches; max_watchers stays a real cap
+    # (persistent resource, not consumption).
+    ops_month: int = 0
+    # Monthly AI-credit grant in cents ($0/$5/$15/$40), rolls over: unused
+    # credits carry into the next period's ai_credits_granted_cents.
+    ai_credits_cents_month: Decimal = Field(
+        default=Decimal("0"),
+        sa_column=Column(Numeric(12, 4), nullable=False),
+    )
     perceive_enabled: bool = False
-    perceive_operations_month: int = 0
     discover_enabled: bool = False
     lookup_enabled: bool = False
-    lookup_queries_month: int = 0
     distill_enabled: bool = False
-    distill_operations_month: int = 0
     ingest_enabled: bool = False
-    ingest_pages_month: int = 0
     watch_enabled: bool = False
     max_watchers: int = 0
     llm_extraction_enabled: bool = False
@@ -337,6 +362,9 @@ class Subscription(SQLModel, table=True):
     payment_subscription_id: Optional[str] = None
     storage_payment_subscription_id: Optional[str] = None
     overage_enabled: bool = False
+    # DEAD COLUMNS: the free trial was removed product-wide — nothing reads or
+    # writes these anymore. Declared only so this twin keeps matching the live
+    # DDL until a migration drops them.
     has_used_trial: bool = False
     trial_end: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
     pending_plan_id: Optional[int] = None
@@ -344,21 +372,28 @@ class Subscription(SQLModel, table=True):
     current_period_end: datetime = Field(sa_type=DateTime(timezone=True))
     storage_period_start: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
     storage_period_end: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
-    # Enterprise overrides
-    override_conversion_limit: Optional[int] = None
+    # Enterprise overrides (unified ops + AI credits since migration 029)
+    override_ops_month: Optional[int] = None
+    override_ai_credits_cents_month: Optional[Decimal] = Field(
+        default=None,
+        sa_column=Column(Numeric(12, 4), nullable=True),
+    )
     override_max_file_size: Optional[int] = None
     override_file_retention_hours: Optional[int] = None
     override_batch_limit: Optional[int] = None
-    # Materialized effective limits
-    effective_conversion_limit: int
+    # Materialized effective limits. effective_ops_month replaces
+    # effective_conversion_limit (dropped by migration 030); resolution is
+    # COALESCE(override_ops_month, plan.ops_month), 0 = unlimited.
+    effective_ops_month: int = 0
     effective_max_file_size: int
     effective_file_retention_hours: int
     effective_batch_limit: int
     effective_storage_bytes: int = 0
     # Notification throttles/dedup (migration 009). last_quota_alert_at is set by
-    # the gateway on 100% usage; the *_sent_at columns dedup the backend cron
-    # reminders. SCHEMA TWIN of backend/models.py Subscription.
+    # the gateway on 100% usage; storage_lapse_warned_at dedups the storage-lapse
+    # warning. SCHEMA TWIN of backend/models.py Subscription.
     last_quota_alert_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    # DEAD COLUMN (see has_used_trial above): no trial reminder exists to stamp it.
     trial_reminder_sent_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
     storage_lapse_warned_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
     created_at: datetime = Field(
@@ -388,16 +423,26 @@ class UsagePeriod(SQLModel, table=True):
     period_start: datetime = Field(sa_type=DateTime(timezone=True))
     period_end: datetime = Field(sa_type=DateTime(timezone=True))
     plan_id: int = Field(index=True)
-    conversions_used: int = 0
-    overage_conversions: int = 0
+    # THE unified counter (migration 029): every op across every endpoint,
+    # ledgered (counter='ops_used'). overage_ops = ops beyond the cap
+    # (metered overage, opt-in per subscription on any paid plan), derived
+    # atomically at increment time.
+    ops_used: int = 0
+    overage_ops: int = 0
     storage_bytes_peak: int = 0
-    # V2 usage counters (migration 011) — independent of V1 conversions_used
-    # (coexistence rule 3, V3 plan section 5).
+    # Per-endpoint telemetry BREAKDOWNS of ops_used — not caps. Incremented
+    # in the same atomic UPDATE that bumps ops_used.
+    conversions_used: int = 0
     perceive_operations: int = 0
     ingest_pages: int = 0
-    watch_checks: int = 0
     lookup_queries: int = 0
     distill_operations: int = 0
+    # AI credits (migration 029): grant + carryover materialized at period
+    # creation; remaining credits = ai_credits_granted_cents - llm_cost_cents.
+    ai_credits_granted_cents: Decimal = Field(
+        default=Decimal("0"),
+        sa_column=Column(Numeric(12, 4), nullable=False),
+    )
     # NUMERIC(12,4) cents: a single LLM call costs a fraction of a cent,
     # so INTEGER cents would round real costs to zero and break the F.6 gate.
     llm_cost_cents: Decimal = Field(
@@ -428,7 +473,7 @@ class UsageLedger(SQLModel, table=True):
     # not — referential integrity matches, cascade behavior is prod-only.)
     __table_args__ = (
         CheckConstraint(
-            "counter IN ('conversions_used', 'llm_cost_cents')",
+            "counter IN ('conversions_used', 'llm_cost_cents', 'ops_used')",
             name="ck_usage_ledger_counter",
         ),
         CheckConstraint(
@@ -446,8 +491,12 @@ class UsageLedger(SQLModel, table=True):
     idempotency_key: str = Field(max_length=200, unique=True)
     project_id: int = Field(index=True, foreign_key="ch_projects.id")
     usage_period_id: int = Field(index=True, foreign_key="ch_usage_periods.id")
-    counter: str = Field(max_length=32)  # conversions_used | llm_cost_cents
-    # v1_conversion | llm_reserve | llm_settle | plan_change_reset
+    # ops_used (unified counter, migration 029) | llm_cost_cents |
+    # conversions_used (historical rows only — pre-unified V1 writes)
+    counter: str = Field(max_length=32)
+    # v1_conversion | v2_perceive | v2_lookup | v2_distill | v2_ingest |
+    # v2_discover | llm_reserve | llm_settle | plan_change_reset |
+    # migration_backfill (029's synthetic ops baseline rows)
     event_type: str = Field(max_length=40)
     delta_units: Optional[int] = None
     delta_cost_cents: Optional[Decimal] = Field(
@@ -526,6 +575,14 @@ class EmailLog(SQLModel, table=True):
             "project_id",
             text("created_at DESC"),
         ),
+        # Per-user lifecycle trail (migration 031): stage dedup + the
+        # founder_call 30-day / lifetime-2 guards read this.
+        Index(
+            "idx_email_log_user_type",
+            "user_id",
+            "email_type",
+            text("created_at DESC"),
+        ),
     )
     id: int | None = Field(
         default=None,
@@ -534,7 +591,10 @@ class EmailLog(SQLModel, table=True):
     # Plain integer, deliberately NO foreign key: an audit log must survive
     # project deletion (same reasoning as ch_scheduled_deletions).
     project_id: int
-    # trial_reminder | storage_lapse | overage_receipt | renewal | upcoming_charge
+    # User axis (migration 031): lifecycle mail is user-scoped, legacy
+    # subscription rows keep NULL. Same no-FK rationale as project_id.
+    user_id: Optional[int] = None
+    # storage_lapse | overage_receipt | renewal | upcoming_charge
     email_type: str = Field(max_length=40)
     email_key: str = Field(max_length=200, unique=True)
     recipient: str = Field(max_length=255)
@@ -551,6 +611,28 @@ class EmailLog(SQLModel, table=True):
     )
     # Confirmed-delivery time; NULL until sent_ok.
     sent_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+
+
+class EmailVerifyToken(SQLModel, table=True):
+    """Email-verification links (migration 031). Clone of
+    ch_password_reset_tokens with a used_at timestamp instead of a boolean —
+    the lifecycle math cares WHEN the link was consumed. The gateway
+    lifecycle runner writes rows; the backend consumes them via
+    POST /email/verify-link. 24h expiry is enforced in code via expires_at.
+    SCHEMA TWIN of backend/models.py EmailVerifyToken."""
+    __tablename__ = "ch_email_verify_tokens"
+    __table_args__ = (Index("idx_email_verify_user", "user_id"),)
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int
+    # SHA-256 hex of the raw token (the raw token only ever lives in the email).
+    token_hash: str = Field(max_length=64, unique=True)
+    expires_at: datetime = Field(sa_type=DateTime(timezone=True))
+    used_at: Optional[datetime] = Field(default=None, sa_type=DateTime(timezone=True))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        sa_type=DateTime(timezone=True),
+    )
 
 
 class ConversionJob(SQLModel, table=True):

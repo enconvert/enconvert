@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -56,8 +57,13 @@ async def run(request: LookupRequest, user: dict) -> LookupResponse:
     warnings: list[str] = list(found.warnings)
     results = [LookupResult(**hit.model_dump()) for hit in found.results]
 
-    # The search succeeded: charge one lookup query and record the audit row.
-    usage.increment_lookup_usage(project_id)
+    # The search succeeded: charge one op and record the audit row. The
+    # ch_lookup_queries row id is not allocated until _persist_lookup_query
+    # below, so a uuid4 key stands in for the natural id (audit trail kept;
+    # replay dedup weakened — accepted in the unified-ops contract).
+    usage.increment_lookup_usage(
+        project_id, idempotency_key=f"v2:op:lookup:{uuid.uuid4().hex}"
+    )
 
     if request.perceive_top > 0 or request.enrich is not None:
         warnings.append(_CLOUD_ONLY_WARNING)

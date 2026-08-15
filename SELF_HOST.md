@@ -91,8 +91,9 @@ the self-hosted build**. Each is a concrete reason to reach for
 - **`watch` with semantic diffing.** Self-hosted watch detects *that* a page
   changed (content-hash). The cloud tells you *what* meaningfully changed —
   structured/semantic diffing across lists, tables, and metadata.
-- **Managed platform.** Dashboard, teams, usage analytics, billing, opt-in overage,
-  domain-restricted keys, and a public status page.
+- **Managed platform.** Dashboard, teams, usage analytics, billing, opt-in metered
+  overage at $0.02/operation on every paid plan, domain-restricted keys, and a
+  public status page.
 
 Every URL EnConvert touches — self-hosted or cloud — is SSRF-screened: no private
 IPs, no metadata endpoints, no internal networks.

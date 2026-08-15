@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from api.v1.router import router as v1_router
 from api.v2.router import router as v2_router
 from api.internal import router as internal_router
+from api.lifecycle_public import router as lifecycle_public_router
 from middleware.cors import DynamicCORSMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
 from middleware.timeout import TimeoutMiddleware
@@ -154,6 +155,9 @@ app.add_middleware(PostHogContextMiddleware)
 app.include_router(v1_router, prefix="/v1", tags=["v1"])
 app.include_router(v2_router, prefix="/v2", tags=["v2"])
 app.include_router(internal_router)
+# Public lifecycle-email endpoints: /email/unsubscribe + /email/webhooks/brevo
+# (unauthenticated by design — HMAC token / webhook secret gate them).
+app.include_router(lifecycle_public_router)
 
 
 @app.get("/", tags=["root"])

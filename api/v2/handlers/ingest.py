@@ -1,8 +1,9 @@
 """POST / GET / DELETE /v2/ingest (Task H.7).
 
-Thin handlers per the coding rules: auth (``get_current_user``), V2 quota
-gate (``ingest_pages`` -- 402 on a disabled plan or an exhausted monthly
-quota), then delegate to the durable ingest pipeline.
+Thin handlers per the coding rules: auth (``get_current_user``),
+kill-switch flag gate + unified ops quota (both 402 on a disabled plan
+or an exhausted monthly cap), then delegate to the durable ingest
+pipeline.
 
 ``/v2/ingest`` is ALWAYS asynchronous: POST validates + gates + creates the
 ch_ingest_jobs row + enqueues the job, and answers 202 with a ``job_id``;
@@ -11,14 +12,15 @@ the JSONL out of band. GET reports lifecycle status (with a signed output URL
 once completed); DELETE cancels (sets status='canceled'; the worker observes
 it between pages and stops without assembling).
 
-The submit-time gate is a fast ``units=1`` check (plan has ingest enabled and
-some monthly headroom). The worker re-checks the quota PER PAGE — so a
-sitemap/crawl job whose page count is unknown up front stops cleanly at the
-cap (remaining pages marked 'skipped') instead of over-spending — and
-increments ``ingest_pages`` only for pages that complete.
+The submit-time gate is a fast ``units=1`` check (ingest kill-switch on and
+some monthly ops headroom). The worker re-checks the ops quota PER PAGE — so
+a sitemap/crawl job whose page count is unknown up front stops cleanly at
+the cap (remaining pages marked 'skipped') instead of over-spending — and
+bills 1 op only for pages that complete.
 
 V1's activity table is reused with ``count_usage=False`` for dashboard
-visibility only (coexistence rule 3: a V2 operation never consumes V1 quota).
+visibility only — billing happens exactly once per completed page inside the
+worker (idempotent record_op_usage choke point).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
-from api.deps import check_v2_quota, get_current_user
+from api.deps import check_ops_quota, check_v2_feature, get_current_user
 from api.v2.schemas.ingest import (
     IngestJobListResponse,
     IngestJobResponse,
@@ -100,7 +102,10 @@ async def ingest(
     402 leaves zero rows behind. SSRF screening runs in the worker (the seed
     via discover_flow, each page via render_html), so submit stays instant.
     """
-    check_v2_quota(user, "ingest_pages", units=1)
+    # Kill-switch flag first, then a fast 1-unit ops headroom check; the
+    # worker re-gates and bills per completed page.
+    check_v2_feature(user, "ingest_enabled", "Ingest")
+    check_ops_quota(user, units=1)
 
     project_id = int(user["id"])
     job_id = f"ing_{uuid.uuid4().hex}"
@@ -177,10 +182,13 @@ async def ingest_files(
     ``GET`` / ``DELETE /v2/ingest/{job_id}`` report status and cancel it.
 
     Files are stored to object storage at submit (so the durable resume can
-    re-read them) and deleted once the JSONL is assembled. Bills one
-    ``ingest_pages`` unit per file, re-checked per file in the worker.
+    re-read them) and deleted once the JSONL is assembled. Bills one op per
+    file against the unified ops quota, re-checked per file in the worker.
     """
-    check_v2_quota(user, "ingest_pages", units=1)
+    # Kill-switch flag first, then a fast 1-unit ops headroom check; the
+    # worker re-gates and bills per completed file.
+    check_v2_feature(user, "ingest_enabled", "Ingest")
+    check_ops_quota(user, units=1)
 
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required.")

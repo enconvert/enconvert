@@ -601,7 +601,11 @@ async def run(
             cache_hit=False,
             duration_ms=duration_ms,
         )
-        usage.increment_perceive_usage(project_id)
+        # Unified ops billing: the operation_id makes a retry/replay of this
+        # exact operation a no-op at the ledger (contract item 5).
+        usage.increment_perceive_usage(
+            project_id, idempotency_key=f"v2:op:perceive:{operation_id}"
+        )
         usage.record_storage_and_retention(
             project_id, uploads, user.get("subscription", {})
         )
@@ -672,7 +676,12 @@ def _serve_from_cache(
         duration_ms=duration_ms,
         render_quality_score=cached.render_quality_score,
     )
-    usage.increment_perceive_usage(project_id)
+    # Cache hits bill like any operation (the quota gates operations, not
+    # renders); the hit row's OWN operation_id keys the ledger, so a fresh
+    # render and its later cache hits each bill exactly once.
+    usage.increment_perceive_usage(
+        project_id, idempotency_key=f"v2:op:perceive:{operation_id}"
+    )
     return PerceiveResponse(
         operation_id=operation_id,
         status="completed",

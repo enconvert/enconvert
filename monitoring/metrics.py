@@ -5,7 +5,8 @@ from sqlmodel import select
 from models import Activity, Project, Alert
 from utils.postgres import get_db
 from utils.error_capture import MAX_ERROR_TYPE_CHARS, truncate_error
-from utils.subscription import increment_conversion_usage, update_storage_peak, is_admin_default_project
+from utils.subscription import update_storage_peak, is_admin_default_project
+from utils.usage_ledger import record_op_usage
 
 
 def _month_bounds(now: datetime) -> tuple[datetime, datetime]:
@@ -161,14 +162,19 @@ async def update_activity_status(
     if first_success and project_id_int is not None and count_usage:
         # Skip usage tracking for admin users' default projects
         if not is_admin_default_project(db, project_id_int):
-            # Count the conversion exactly once: activity_id is stable
-            # for this logical conversion across retries/redeliveries,
-            # so the ledger (migration 016) dedups on it even if this
-            # function is somehow re-entered past the first_success
-            # guard (e.g. a status flap or replayed update).
-            increment_conversion_usage(
-                project_id_int,
+            # Count the conversion exactly once against the unified ops
+            # counter (migration 029), with the V1 breakdown column bumped
+            # in the same statement: activity_id is stable for this
+            # logical conversion across retries/redeliveries, so the
+            # ledger (migration 016) dedups on it even if this function
+            # is somehow re-entered past the first_success guard (e.g. a
+            # status flap or replayed update).
+            record_op_usage(
+                project_id=project_id_int,
                 idempotency_key=f"v1:conversion:{activity_id}",
+                units=1,
+                event_type="v1_conversion",
+                breakdown="conversions_used",
             )
 
             # Update project.storage_used (live counter kept on project)

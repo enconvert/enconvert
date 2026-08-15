@@ -1,18 +1,18 @@
 """POST /v2/distill (Task H.5).
 
-Thin handler per the coding rules: auth (``get_current_user``), V2 quota
-gate (``distill_operations`` -- 402 on a disabled plan or an exhausted
-monthly quota), then delegate to ``services.v2_engine.distill_flow``.
+Thin handler per the coding rules: auth (``get_current_user``),
+kill-switch flag gate + unified ops quota (both 402 on a disabled plan
+or an exhausted monthly cap), then delegate to
+``services.v2_engine.distill_flow``.
 
-The gate here is a fast ``units=1`` check that rejects a disabled plan or a
-zero-headroom quota before any render. The flow re-checks the quota PER URL
-(so ``discover_from``, whose URL count is unknown up front, and a large
-``urls[]`` list both stop cleanly at the cap instead of over-spending) and
-increments the counter only for URLs that complete.
+For an explicit ``urls[]`` list the whole batch is pre-checked here; for
+``discover_from`` the URL count is unknown up front, so the gate reserves
+1 unit and the flow re-checks the ops quota PER URL (stop-at-boundary)
+and bills only URLs that complete.
 
 V1's activity table is reused with ``count_usage=False`` for dashboard
-visibility only (coexistence rule 3: a V2 operation never consumes V1
-conversion quota).
+visibility only — billing happens exactly once per completed URL inside
+the flow (idempotent record_op_usage choke point).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from api.deps import check_v2_feature, check_v2_quota, get_current_user
+from api.deps import check_ops_quota, check_v2_feature, get_current_user
 from api.v2.schemas.distill import DistillRequest, DistillResponse
 from monitoring import posthog_client
 from monitoring.metrics import log_activity_start, update_activity_status
@@ -47,12 +47,13 @@ async def distill(
     user: dict = Depends(get_current_user),
 ) -> DistillResponse:
     """Schema-driven structured extraction (CSS-first, LLM fallback)."""
-    # For an explicit urls[] list the count is known, so pre-reject an
-    # over-quota request before any render; discover_from's count is
-    # unknown up front, so it gates 1 unit here and the flow re-checks per
-    # discovered URL.
+    # Kill-switch flag first, then the unified ops gate. For an explicit
+    # urls[] list the count is known, so pre-reject an over-quota request
+    # before any render; discover_from's count is unknown up front, so it
+    # gates 1 unit here and the flow re-checks per discovered URL.
+    check_v2_feature(user, "distill_enabled", "Distill")
     units = len(body.urls) if body.urls else 1
-    check_v2_quota(user, "distill_operations", units=units)
+    check_ops_quota(user, units=units)
     # discover_from drives discover_flow, so it must carry the discover
     # plan flag too — otherwise a distill-only plan could use discover for
     # free by routing through here.

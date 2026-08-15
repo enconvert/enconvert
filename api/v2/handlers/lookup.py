@@ -1,15 +1,16 @@
 """POST /v2/lookup (Task H.3).
 
-Thin handler per the coding rules: auth (``get_current_user``), V2 quota
-gate (``lookup_queries`` -- 402 on a disabled plan or an exhausted
-monthly quota, H.3 verification d), then delegate to
+Thin handler per the coding rules: auth (``get_current_user``),
+kill-switch flag gate + unified ops quota (both 402 on a disabled plan
+or an exhausted monthly cap, H.3 verification d), then delegate to
 ``services.v2_engine.lookup_flow``. V1's activity table is reused with
-``count_usage=False`` for dashboard visibility only (coexistence rule 3:
-a V2 operation never consumes V1 conversion quota).
+``count_usage=False`` for dashboard visibility only — billing happens
+exactly once inside the flow (idempotent record_op_usage choke point).
 
-The lookup quota is checked HERE, before the flow runs, so nothing is
-billed when the gate rejects. The flow itself bumps the counter and
-writes the audit row only after Serper actually answers.
+The ops gate runs HERE, before the flow, so nothing is billed when it
+rejects. The flow itself bumps the counter and writes the audit row only
+after Serper actually answers; auto-perceive enrichment compounds ops on
+top of the query op (founder decision 2026-08-13: compounding kept).
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from api.deps import check_v2_quota, get_current_user
+from api.deps import check_ops_quota, check_v2_feature, get_current_user
 from api.v2.schemas.lookup import LookupRequest, LookupResponse
 from monitoring import posthog_client
 from monitoring.metrics import log_activity_start, update_activity_status
@@ -43,7 +44,10 @@ async def lookup(
     user: dict = Depends(get_current_user),
 ) -> LookupResponse:
     """Search the web via Serper, optionally auto-perceiving top results."""
-    check_v2_quota(user, "lookup_queries")
+    # Kill-switch flag first, then the unified ops gate (1 op per query;
+    # enrichment ops are gated per URL inside the flow).
+    check_v2_feature(user, "lookup_enabled", "Lookup")
+    check_ops_quota(user)
 
     activity_id = await log_activity_start(
         project_id=user["id"],

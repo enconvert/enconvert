@@ -124,6 +124,22 @@ class PerceiveOptionsBase(BaseModel):
         "would remove too much real content. When false, the full page "
         "content is kept with no stripping.",
     )
+    truncate_data_arrays: Optional[bool] = Field(
+        default=None,
+        description="Collapse long runs of numeric literals (raw "
+        "embedding vectors, tensor dumps in notebook output cells) to a "
+        "leading sample plus a count. Unset (the default) follows "
+        "only_main_content: on when the page is being curated, off when "
+        "the caller asked for the page as-is. Set true/false to control "
+        "it explicitly.",
+    )
+    allow_degraded: bool = Field(
+        default=False,
+        description="When true, return the render even if it is an "
+        "anti-bot challenge or block page with no page content. By "
+        "default such a render fails with 502 rather than delivering "
+        "the interstitial's text as if it were the page.",
+    )
     direct_download: bool = Field(
         default=False,
         description="When true, the response body IS the artifact bytes "

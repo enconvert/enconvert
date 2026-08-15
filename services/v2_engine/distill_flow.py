@@ -21,13 +21,13 @@ Output shape is GUARANTEED: the merged result is normalized to exactly
 the caller's schema keys (missing -> null / empty array), which is the
 product differentiator over a raw scraper.
 
-Cost & quota model (coexistence rule 3): distill bills its OWN
-``distill_operations`` counter, one per URL completed, and writes one
-``ch_distill_operations`` row per URL. It NEVER routes through a full
-``/v2/perceive`` operation (which would double-charge perceive quota and
-litter that audit table); it uses ``perceive_flow.render_html``, the
-persistence-free render entry point. Rendering is sequential through the
-shared Chromium singleton (plan A5).
+Cost & quota model: distill bills the unified ops counter, one op per
+URL completed (with ``distill_operations`` kept as its telemetry
+breakdown), and writes one ``ch_distill_operations`` row per URL. It
+NEVER routes through a full ``/v2/perceive`` operation (which would
+double-bill the op and litter that audit table); it uses
+``perceive_flow.render_html``, the persistence-free render entry point.
+Rendering is sequential through the shared Chromium singleton (plan A5).
 
 Two URL sources (exactly one per request, enforced in the schema):
 ``urls[]`` (explicit) or ``discover_from`` (crawl/sitemap the site first
@@ -37,6 +37,7 @@ via ``discover_flow``, then distill each discovered URL).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -46,7 +47,7 @@ from typing import Any, Literal, Optional
 
 from fastapi import HTTPException
 
-from api.deps import check_v2_quota
+from api.deps import check_ops_quota
 from api.v2.schemas.discover import DiscoverRequest
 from api.v2.schemas.distill import (
     DistillItemResult,
@@ -63,9 +64,10 @@ from utils.postgres import get_db
 logger = logging.getLogger(__name__)
 
 # Request-level LLM backstop. The authoritative caps are F.6's (per-call
-# $0.05 + per-period $5/$20 on ch_usage_periods.llm_cost_cents); this is a
-# defence-in-depth ceiling so one multi-URL distill cannot consume the
-# whole period budget in a single call. URLs past the ceiling return
+# $0.05 + the period's AI-credit allowance, ai_credits_granted_cents,
+# enforced inside reserve_llm_budget); this is a defence-in-depth ceiling
+# so one multi-URL distill cannot consume the whole period budget in a
+# single call. URLs past the ceiling return
 # CSS-only with a warning. Generous vs the verification target (3-URL
 # e-commerce distill, mostly CSS, stays well under $0.10).
 _REQUEST_LLM_BUDGET_CENTS = Decimal("50")  # $0.50 per /v2/distill request
@@ -495,15 +497,15 @@ async def run(request: DistillRequest, operation_id: str, user: dict) -> Distill
     results: list[DistillItemResult] = []
 
     for url_index, url in enumerate(urls):
-        # Per-URL quota: enforces the cap for discover_from (count unknown
-        # up front) AND stops a urls[] request that crosses the boundary
-        # mid-way, instead of 402-ing the whole batch.
+        # Per-URL quota: enforces the unified ops cap for discover_from
+        # (count unknown up front) AND stops a urls[] request that crosses
+        # the boundary mid-way, instead of 402-ing the whole batch.
         try:
-            check_v2_quota(user, "distill_operations", units=1)
+            check_ops_quota(user, units=1)
         except HTTPException:
             warnings.append(
-                f"distill quota exhausted at {len(results)}/{len(urls)} URLs; "
-                "remaining URLs skipped. Upgrade your plan to continue."
+                f"monthly ops quota exhausted at {len(results)}/{len(urls)} "
+                "URLs; remaining URLs skipped. Upgrade your plan to continue."
             )
             break
 
@@ -536,7 +538,14 @@ async def run(request: DistillRequest, operation_id: str, user: dict) -> Distill
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         if item.status == "completed":
-            usage.increment_distill_usage(project_id)
+            # operation_id + hashed URL: URLs are de-duplicated per request
+            # (_resolve_urls), so the pair is unique per completed URL and a
+            # replay of the same operation bills each URL exactly once.
+            url_digest = hashlib.md5(url.encode("utf-8")).hexdigest()[:16]
+            usage.increment_distill_usage(
+                project_id,
+                idempotency_key=f"v2:op:distill:{operation_id}:{url_digest}",
+            )
 
     completed = sum(1 for item in results if item.status == "completed")
     failed = sum(1 for item in results if item.status == "failed")

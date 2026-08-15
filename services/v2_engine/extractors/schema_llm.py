@@ -1,11 +1,13 @@
 """Tier-3 LLM extraction — open-source fallback (cloud-only capability).
 
 The real module runs a capped, metered LLM extraction engine with a layered
-budget ledger; that engine ships only in the EnConvert cloud build. This
-fallback keeps the PUBLIC surface open callers and tests rely on — the
-result dataclasses (same fields), the skip-reason constants and the
-``period_cap_cents`` billing helper — while the three async entry points
-(``extract``, ``synthesize_schema``, ``answer_from_sources``) raise
+budget ledger (the per-period ceiling is the usage period's AI-credit
+allowance, ai_credits_granted_cents, enforced inside the cloud build's
+``usage.reserve_llm_budget``); that engine ships only in the EnConvert
+cloud build. This fallback keeps the PUBLIC surface open callers and tests
+rely on — the result dataclasses (same fields) and the skip-reason
+constants — while the three async entry points (``extract``,
+``synthesize_schema``, ``answer_from_sources``) raise
 :class:`CloudEngineRequired` (HTTP 501).
 
 Self-hosted deployments never reach these entry points in normal
@@ -22,16 +24,15 @@ from typing import Any, Optional
 
 from services._engine_fallback import CloudEngineRequired
 
-# The extraction model and budget caps are a cloud-only concern and are not
-# part of the open-source build. These placeholders exist purely so imports,
-# the ``period_cap_cents`` helper, and verification harnesses resolve against
-# the same names; the real model and caps live in the EnConvert cloud build.
-MODEL_SLUG = "cloud-managed"
-
+# The extraction engine and budget caps are a cloud-only concern and are not
+# part of the open-source build. This placeholder exists purely so imports
+# and verification harnesses resolve against the same names; the real caps
+# live in the EnConvert cloud build (the per-period ceiling there is the
+# usage period's ai_credits_granted_cents — no slug-keyed caps).
+#
+# There is deliberately no MODEL_SLUG: the cloud build chooses its provider
+# and model at runtime and names neither in this module.
 PER_REQUEST_CAP_CENTS = Decimal("0")
-DEFAULT_PERIOD_CAP_CENTS = Decimal("0")
-ELEVATED_PERIOD_CAP_CENTS = Decimal("0")
-_ELEVATED_CAP_SLUGS: frozenset[str] = frozenset()
 
 # Skip reasons (ExtractionResult.skipped_reason values in the cloud build).
 SKIP_NOT_CONFIGURED = "llm_api_key_not_configured"
@@ -85,15 +86,6 @@ class AnswerResult:
     output_tokens: int = 0
     cost_cents: Decimal = Decimal("0")
     skipped_reason: Optional[str] = None
-
-
-def period_cap_cents(plan_slug: str) -> Decimal:
-    """Budget cap for a plan slug; unknown slugs get the TIGHT cap."""
-    return (
-        ELEVATED_PERIOD_CAP_CENTS
-        if plan_slug in _ELEVATED_CAP_SLUGS
-        else DEFAULT_PERIOD_CAP_CENTS
-    )
 
 
 async def extract(

@@ -1,12 +1,11 @@
 """Subscription lifecycle email pass (droplet systemd design, no GCP).
 
 Run by scripts/ops/rotate_usage_periods.py AFTER the billing-rotation drain,
-under the enconvert-billing-rotation systemd timer. Five email types:
+under the enconvert-billing-rotation systemd timer. Four email types:
 
     overage_receipt   receipt for a captured PayPal overage charge
     renewal           a new billing period started (quota reset)
     upcoming_charge   ~2 days before PayPal charges the payment method
-    trial_reminder    trial converts to paid within ~3 days
     storage_lapse     cancelled storage add-on expires within ~3 days
 
 Dedup contract (ch_email_log, migration 019): INSERT ... ON CONFLICT
@@ -21,12 +20,12 @@ a retry can duplicate an email. That is an annoyance, not money — this module
 never charges anyone (billing_rotation._capture_overage owns charging, with
 its own DB-unique dedup).
 
-Legacy columns: on a successful trial_reminder / storage_lapse send the pass
-also stamps ch_subscriptions.trial_reminder_sent_at / storage_lapse_warned_at
-(migration 009). Those columns are what the dormant backend sweep
-(backend/scripts/ops/send_scheduled_emails.py) dedups on, so stamping keeps
-that script a guaranteed no-op if its timer ever appears. They are never used
-for candidate FILTERING here — ch_email_log.email_key governs.
+Legacy column: on a successful storage_lapse send the pass also stamps
+ch_subscriptions.storage_lapse_warned_at (migration 009). That column is what
+the dormant backend sweep (backend/scripts/ops/send_scheduled_emails.py)
+dedups on, so stamping keeps that script a guaranteed no-op if its timer ever
+appears. It is never used for candidate FILTERING here — ch_email_log.email_key
+governs.
 """
 from __future__ import annotations
 
@@ -110,24 +109,6 @@ class EmailCandidate:
 # ---------------------------------------------------------------------------
 
 
-def build_trial_reminder_candidate(row: dict, now: datetime) -> Optional[EmailCandidate]:
-    trial_end = _aware(row["trial_end"])
-    if trial_end <= now:
-        return None  # staleness: never announce a trial that already ended
-    days_left = max(1, (trial_end - now).days)
-    return EmailCandidate(
-        project_id=row["project_id"],
-        email_type="trial_reminder",
-        email_key=f"trial_reminder:{row['project_id']}:{_key_ts(trial_end)}",
-        context={
-            "plan_name": row["plan_name"],
-            "trial_end": trial_end.isoformat(),
-            "days_left": days_left,
-            "event_at": trial_end.isoformat(),
-        },
-    )
-
-
 def build_storage_lapse_candidate(row: dict, now: datetime) -> Optional[EmailCandidate]:
     period_end = _aware(row["storage_period_end"])
     if period_end <= now:
@@ -174,7 +155,7 @@ def build_overage_receipt_candidate(row: dict, now: datetime) -> Optional[EmailC
             "charged_on": payment_time.isoformat(),
             "plan_name": row["plan_name"],
             # Filled by the DB pass (usage-period lookup); None means unknown.
-            "overage_conversions": row.get("overage_conversions"),
+            "overage_ops": row.get("overage_ops"),
             # Receipts never expire inside the retry window: a late receipt
             # for a real charge is still correct. No event_at on purpose.
         },
@@ -192,7 +173,7 @@ def build_renewal_candidate(row: dict, now: datetime) -> Optional[EmailCandidate
             "plan_name": row["plan_name"],
             "period_start": period_start.isoformat(),
             "period_end": period_end.isoformat(),
-            "conversion_limit": int(row["effective_conversion_limit"]),
+            "ops_limit": int(row["ops_limit"]),
         },
     )
 
@@ -201,12 +182,6 @@ def build_upcoming_plan_charge_candidate(row: dict, now: datetime) -> Optional[E
     period_end = _aware(row["current_period_end"])
     if period_end <= now:
         return None  # the charge date already passed; silence beats confusion
-    trial_end = row.get("trial_end")
-    if trial_end is not None and _aware(trial_end) >= period_end:
-        # During a trial, trial_end == the first current_period_end and the
-        # trial_reminder already announces that first charge. Strict >= keeps
-        # exactly that case out and nothing else.
-        return None
     line_items = [
         {
             "label": f"{row['plan_name']} plan renewal",
@@ -216,14 +191,19 @@ def build_upcoming_plan_charge_candidate(row: dict, now: datetime) -> Optional[E
     ]
     # Mirror _capture_overage's own guards (billing_rotation) including the
     # sub-cent floor, so we never predict a charge rotation would skip.
-    accrued = int(row.get("overage_conversions") or 0)
+    accrued = int(row.get("overage_ops") or 0)
     rate_cents = float(row.get("overage_rate_cents") or 0)
-    if row.get("overage_enabled") and rate_cents > 0 and accrued > 0:
+    if (
+        row.get("overage_allowed")
+        and row.get("overage_enabled")
+        and rate_cents > 0
+        and accrued > 0
+    ):
         overage_cents = accrued * rate_cents
         if overage_cents >= 1:
             line_items.append(
                 {
-                    "label": f"Estimated overage ({accrued} conversions so far)",
+                    "label": f"Estimated overage ({accrued} operations so far)",
                     "amount": f"{overage_cents / 100:.2f}",
                     "currency": "USD",
                 }
@@ -279,14 +259,6 @@ def is_expired(email_type: str, context: dict, now: datetime) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _send_trial(recipient: str, ctx: dict, now: datetime) -> bool:
-    trial_end = datetime.fromisoformat(ctx["trial_end"])
-    days_left = max(1, (trial_end - now).days)  # recompute: retries drift
-    return email_notifier.send_trial_ending_email(
-        recipient, ctx["plan_name"], trial_end.strftime(_DATE_FMT), days_left
-    )
-
-
 def _send_storage_lapse(recipient: str, ctx: dict, now: datetime) -> bool:
     return email_notifier.send_storage_lapse_warning_email(
         recipient,
@@ -303,7 +275,9 @@ def _send_overage_receipt(recipient: str, ctx: dict, now: datetime) -> bool:
         ctx["currency"],
         _fmt_date(ctx["charged_on"]),
         ctx["plan_name"],
-        ctx.get("overage_conversions"),
+        # Legacy fallback: rows CLAIMED by the pre-unified build inside the
+        # retry window carry the old context key.
+        ctx.get("overage_ops", ctx.get("overage_conversions")),
     )
 
 
@@ -313,7 +287,8 @@ def _send_renewal(recipient: str, ctx: dict, now: datetime) -> bool:
         ctx["plan_name"],
         _fmt_date(ctx["period_start"]),
         _fmt_date(ctx["period_end"]),
-        ctx["conversion_limit"],
+        # Legacy fallback (see _send_overage_receipt).
+        int(ctx.get("ops_limit", ctx.get("conversion_limit", 0))),
     )
 
 
@@ -324,19 +299,14 @@ def _send_upcoming_charge(recipient: str, ctx: dict, now: datetime) -> bool:
 
 
 _SENDERS: dict[str, Callable[[str, dict, datetime], bool]] = {
-    "trial_reminder": _send_trial,
     "storage_lapse": _send_storage_lapse,
     "overage_receipt": _send_overage_receipt,
     "renewal": _send_renewal,
     "upcoming_charge": _send_upcoming_charge,
 }
 
-# Legacy dedup columns stamped on successful send (see module docstring).
+# Legacy dedup column stamped on successful send (see module docstring).
 _LEGACY_STAMPS = {
-    "trial_reminder": text(
-        "UPDATE ch_subscriptions SET trial_reminder_sent_at = :now"
-        " WHERE project_id = :project_id"
-    ),
     "storage_lapse": text(
         "UPDATE ch_subscriptions SET storage_lapse_warned_at = :now"
         " WHERE project_id = :project_id"
@@ -351,22 +321,6 @@ _LEGACY_STAMPS = {
 # and the unique-key claim is the authoritative dedup — a conflicting claim
 # costs one INSERT that inserts nothing.
 # ---------------------------------------------------------------------------
-
-_TRIAL_CANDIDATES = text(
-    """
-    SELECT s.project_id, s.trial_end, p.name AS plan_name
-    FROM ch_subscriptions s
-    JOIN ch_plans p ON p.id = s.plan_id
-    WHERE s.trial_end IS NOT NULL
-      AND s.trial_end >  :now
-      AND s.trial_end <= :now + INTERVAL '3 days'
-      AND s.status = 'active'
-      -- every cancel path nulls these; "you WILL be charged" must never
-      -- reach a canceller
-      AND s.payment_provider IS NOT NULL
-      AND s.payment_subscription_id IS NOT NULL
-    """
-)
 
 _STORAGE_LAPSE_CANDIDATES = text(
     """
@@ -411,7 +365,7 @@ _OVERAGE_RECEIPT_CANDIDATES = text(
 # name the NEXT plan.
 _OVERAGE_PERIOD_LOOKUP = text(
     """
-    SELECT up.overage_conversions, p.name AS period_plan_name
+    SELECT up.overage_ops, p.name AS period_plan_name
     FROM ch_usage_periods up
     JOIN ch_plans p ON p.id = up.plan_id
     WHERE up.project_id = :project_id
@@ -420,10 +374,17 @@ _OVERAGE_PERIOD_LOOKUP = text(
     """
 )
 
+# ops_limit is the RESOLVED effective unified ops cap (migration 029):
+# override, then the materialized effective column (NULLIF heals rows
+# created in the migration-apply -> deploy gap), then the plan cap — the
+# same resolution as utils.subscription.get_subscription. Resolved 0 =
+# unlimited (enterprise); those rarely pass the price_monthly > 0 filter.
 _RENEWAL_CANDIDATES = text(
     """
     SELECT s.project_id, s.current_period_start, s.current_period_end,
-           s.effective_conversion_limit, p.name AS plan_name
+           COALESCE(s.override_ops_month, NULLIF(s.effective_ops_month, 0),
+                    p.ops_month) AS ops_limit,
+           p.name AS plan_name
     FROM ch_subscriptions s
     JOIN ch_plans p ON p.id = s.plan_id
     WHERE s.status = 'active'
@@ -431,8 +392,6 @@ _RENEWAL_CANDIDATES = text(
       AND p.price_monthly > 0            -- free plans rotate too; never spam them
       AND s.current_period_start <= :now
       AND s.current_period_start >  :now - INTERVAL '3 days'
-      -- not the trial period itself
-      AND (s.trial_end IS NULL OR s.trial_end <= s.current_period_start)
       -- a ROTATED boundary, not first activation: rotation keeps periods
       -- contiguous (prior period_end == new period_start); a fresh subscribe
       -- creates only one period. Multi-month catch-up fires ONCE by
@@ -458,12 +417,13 @@ _RENEWAL_CANDIDATES = text(
 # matching — "your card will be charged" must never reach a canceller.
 _UPCOMING_PLAN_CANDIDATES = text(
     """
-    SELECT s.project_id, s.current_period_end, s.trial_end,
+    SELECT s.project_id, s.current_period_end,
            s.overage_enabled,
            COALESCE(pp.name, p.name) AS plan_name,
            COALESCE(pp.price_monthly, p.price_monthly) AS price_monthly,
+           p.overage_allowed,
            p.overage_rate_cents,
-           COALESCE(up.overage_conversions, 0) AS overage_conversions
+           COALESCE(up.overage_ops, 0) AS overage_ops
     FROM ch_subscriptions s
     JOIN ch_plans p ON p.id = s.plan_id
     LEFT JOIN ch_plans pp ON pp.id = s.pending_plan_id
@@ -543,6 +503,10 @@ _RETRYABLE_IDS = text(
     SELECT id
     FROM ch_email_log
     WHERE sent_ok = FALSE
+      -- Onboarding lifecycle rows are retried by services/lifecycle_emails.py
+      -- (which owns their stage rechecks and dry-run semantics), never here.
+      AND email_type NOT LIKE 'lifecycle%'
+      AND email_type <> 'founder_call'
       AND created_at > :now - INTERVAL '{int(RETRY_WINDOW_HOURS)} hours'
       AND created_at < :now - INTERVAL '{int(RETRY_GRACE_MINUTES)} minutes'
       AND attempts < :max_cap
@@ -677,11 +641,11 @@ def _run_type_pass(
 
 def _enrich_overage_row(db: Session, row: dict) -> None:
     """Best-effort receipt enrichment: parse the marker's period_start and
-    look up the ending usage period for the conversion count AND the plan the
-    overage actually accrued on. Misses just omit the count and fall back to
-    the subscription's current plan name — never block a receipt on
+    look up the ending usage period for the overage op count AND the plan
+    the overage actually accrued on. Misses just omit the count and fall
+    back to the subscription's current plan name — never block a receipt on
     bookkeeping."""
-    row["overage_conversions"] = None
+    row["overage_ops"] = None
     period_start = parse_overage_marker(row["paypal_transaction_id"])
     if period_start is None:
         return
@@ -690,7 +654,7 @@ def _enrich_overage_row(db: Session, row: dict) -> None:
         {"project_id": row["project_id"], "period_start": period_start},
     ).first()
     if hit is not None:
-        row["overage_conversions"] = int(hit[0])
+        row["overage_ops"] = int(hit[0])
         row["plan_name"] = hit[1]
 
 
@@ -713,10 +677,6 @@ def _pass_upcoming_charges(db: Session, now: datetime) -> dict:
         db, now, _UPCOMING_STORAGE_CANDIDATES, build_upcoming_storage_charge_candidate
     )
     return {key: plan[key] + storage[key] for key in plan}
-
-
-def _pass_trial_reminders(db: Session, now: datetime) -> dict:
-    return _run_type_pass(db, now, _TRIAL_CANDIDATES, build_trial_reminder_candidate)
 
 
 def _pass_storage_lapse(db: Session, now: datetime) -> dict:
@@ -786,7 +746,6 @@ _PASSES: list[tuple[str, Callable]] = [
     ("overage_receipt", _pass_overage_receipts),
     ("renewal", _pass_renewal_notices),
     ("upcoming_charge", _pass_upcoming_charges),
-    ("trial_reminder", _pass_trial_reminders),
     ("storage_lapse", _pass_storage_lapse),
 ]
 

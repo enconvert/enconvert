@@ -4,7 +4,7 @@ from typing import Optional
 from datetime import datetime, timezone
 import logging
 
-from api.deps import get_current_user, check_conversion_limit, check_storage_limit, validate_file_size
+from api.deps import get_current_user, check_ops_quota, check_storage_limit, validate_file_size
 from monitoring.metrics import log_activity_start, update_activity_status
 from utils.error_capture import error_fields
 from utils.storage import upload_to_gcs, generate_presigned_url
@@ -35,8 +35,8 @@ async def upload_capture(
     if capture_type not in ("screenshot", "pdf"):
         raise HTTPException(status_code=400, detail="capture_type must be 'screenshot' or 'pdf'")
 
-    # Always check conversion limits (billing)
-    check_conversion_limit(user)
+    # Always check the unified ops quota (1 op per capture — billing)
+    check_ops_quota(user)
 
     endpoint = f"extension-{capture_type}"
     input_size = file_size or 0

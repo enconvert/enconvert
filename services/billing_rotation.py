@@ -83,18 +83,49 @@ PAYPAL_BASE_URL = (
 _worker_task: Optional[asyncio.Task] = None
 
 # Every counter column is explicit (not left to DDL defaults): the prod
-# schema has DEFAULTs from migrations 001/011, but create_all-bootstrapped
-# dev DBs do not — raw INSERTs bypass SQLModel's Python-side defaults.
+# schema has DEFAULTs from migrations 001/011/029, but create_all-
+# bootstrapped dev DBs do not — raw INSERTs bypass SQLModel's Python-side
+# defaults. ai_credits_granted_cents is materialized HERE (contract item:
+# full rollover): this month's grant (the subscription override beats the
+# plan's ai_credits_cents_month) PLUS whatever the project's latest earlier
+# period left unspent (granted - llm spent, floored at 0; 0 when no earlier
+# period exists). Rows inserted earlier in the SAME transaction are visible
+# to later statements, so the multi-month catch-up walk in _rotate_sync
+# chains the carryover correctly period by period.
 _INSERT_PERIOD_IF_ABSENT = text(
     """
     INSERT INTO ch_usage_periods
         (project_id, period_start, period_end, plan_id,
-         conversions_used, overage_conversions, storage_bytes_peak,
-         perceive_operations, ingest_pages, watch_checks,
-         lookup_queries, distill_operations, llm_cost_cents, created_at)
-    VALUES
-        (:project_id, :period_start, :period_end, :plan_id,
-         0, 0, 0, 0, 0, 0, 0, 0, 0, :now)
+         ops_used, overage_ops, storage_bytes_peak,
+         conversions_used, perceive_operations, ingest_pages,
+         lookup_queries, distill_operations,
+         ai_credits_granted_cents, llm_cost_cents, created_at)
+    SELECT
+        :project_id, :period_start, :period_end, :plan_id,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        COALESCE(
+            (SELECT s.override_ai_credits_cents_month
+             FROM ch_subscriptions s
+             WHERE s.project_id = :project_id),
+            (SELECT p.ai_credits_cents_month
+             FROM ch_plans p
+             WHERE p.id = :plan_id),
+            0)
+        + COALESCE(
+            (SELECT GREATEST(
+                        prev.ai_credits_granted_cents - prev.llm_cost_cents,
+                        0)
+             FROM ch_usage_periods prev
+             WHERE prev.project_id = :project_id
+               AND prev.period_start < :period_start
+               -- CLOSED periods only: a still-open overlapping row (e.g.
+               -- created by a replayed backend activation) must not roll
+               -- its grant forward. Matches backend _upsert_usage_period.
+               AND prev.period_end <= :period_start
+             ORDER BY prev.period_start DESC
+             LIMIT 1),
+            0),
+        0, :now
     ON CONFLICT (project_id, period_start) DO NOTHING
     """
 )
@@ -140,13 +171,19 @@ def _capture_overage(
 
     Dedup: skips if this period's overage marker row already exists;
     writes the marker row on success. Only charges when overage is
-    enabled, accrued, priced, and a PayPal subscription exists.
+    allowed by the plan, enabled on the subscription, accrued, priced, and
+    a PayPal subscription exists.
     """
     if not sub.overage_enabled:
         return
+    # Mirror the request-path gate (api.deps.check_ops_quota), which requires
+    # overage_allowed AND overage_enabled: if a plan reseed only half-applied,
+    # the ops that got 402'd at the gate must not be billed here.
+    if not plan.overage_allowed:
+        return
     if not sub.payment_subscription_id:
         return
-    if usage.overage_conversions <= 0:
+    if usage.overage_ops <= 0:
         return
     if plan.overage_rate_cents <= 0:
         return
@@ -156,7 +193,7 @@ def _capture_overage(
         )
         return
 
-    overage_amount = usage.overage_conversions * plan.overage_rate_cents / 100
+    overage_amount = usage.overage_ops * plan.overage_rate_cents / 100
     if overage_amount < 0.01:
         return
 
@@ -175,8 +212,8 @@ def _capture_overage(
 
     amount_str = f"{overage_amount:.2f}"
     note = (
-        f"Overage: {usage.overage_conversions} extra conversions "
-        f"at ${plan.overage_rate_cents / 100:.3f}/each"
+        f"Overage: {usage.overage_ops} extra operations "
+        f"at ${plan.overage_rate_cents / 100:.2f}/each"
     )
 
     try:
@@ -212,8 +249,8 @@ def _capture_overage(
 
             if capture_resp.status_code in (200, 202):
                 logger.info(
-                    "Overage capture of $%s accepted for project %s (%s conversions)",
-                    amount_str, sub.project_id, usage.overage_conversions,
+                    "Overage capture of $%s accepted for project %s (%s ops)",
+                    amount_str, sub.project_id, usage.overage_ops,
                 )
                 db.add(PaymentHistory(
                     project_id=sub.project_id,
@@ -294,7 +331,14 @@ def _rotate_sync(project_id: int) -> dict:
                 ).first()
                 if pending_plan:
                     sub.plan_id = pending_plan.id
-                    sub.effective_conversion_limit = pending_plan.conversion_limit
+                    # Unified ops cap (migration 029): a per-subscription
+                    # override survives the plan change, matching
+                    # utils.subscription.recompute_effective_limits.
+                    sub.effective_ops_month = (
+                        sub.override_ops_month
+                        if sub.override_ops_month is not None
+                        else pending_plan.ops_month
+                    )
                     sub.effective_max_file_size = pending_plan.max_file_size
                     sub.effective_file_retention_hours = pending_plan.file_retention_hours
                     sub.effective_batch_limit = pending_plan.batch_limit

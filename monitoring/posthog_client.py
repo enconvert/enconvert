@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 #   batch_conversion_requested / batch_conversion_completed
 #   file_download_proxied
 #   upload_rejected_oversized / upload_rejected_bad_format
-#   conversion_limit_reached / storage_limit_reached
+#   ops_limit_reached / storage_limit_reached
 #   feature_gate_blocked / auth_failed
 #   v2_perceive_requested / _completed / _failed
 #   v2_lookup_performed / v2_distill_completed / v2_discover_completed
@@ -155,33 +155,56 @@ def group_of(project_id: Any) -> dict[str, str]:
     return {"project": str(project_id)}
 
 
-def source_from(user: dict, request: Any = None) -> str:
-    """Traffic source in {web, api, sdk, mcp, extension}.
+def surface_from_request(key_type: str, user_agent: str, origin: str) -> str:
+    """Pure surface classifier in {web, api, sdk, mcp, extension, cli, n8n}.
 
-    Derived from key_type and, when available, the request's User-Agent /
-    Origin. Browser widget + dashboard keys are ``web``; a chrome-extension
-    origin is ``extension``; private-key traffic defaults to ``api`` unless
-    the User-Agent advertises the SDK or an MCP client.
+    Single source of truth for the surface vocabulary: ``source_from``
+    (analytics) and the API-key usage stamp (``auth/usage_stamp.py``,
+    ``ch_api_keys.first_used_surface``) both route through here so the two
+    can never drift. Browser widget + dashboard keys are ``web``; a
+    chrome-extension origin is ``extension``; private-key traffic defaults
+    to ``api`` unless the User-Agent advertises the SDK, an MCP client, the
+    CLI, or the n8n node. ``enconvert-cli`` / ``enconvert-n8n`` are checked
+    before the generic SDK match because both are built on the SDK
+    transport; ``mcp`` stays first among the UA checks so MCP traffic never
+    degrades to ``sdk``.
+    """
+    ua = (user_agent or "").lower()
+    origin = origin or ""
+    if origin.startswith("chrome-extension://") or "enconvert-extension" in ua:
+        return "extension"
+    if "mcp" in ua:
+        return "mcp"
+    if "enconvert-cli" in ua:
+        return "cli"
+    if "enconvert-n8n" in ua:
+        return "n8n"
+    if "enconvert-sdk" in ua or "python-sdk" in ua or "node-sdk" in ua:
+        return "sdk"
+    if key_type in ("public", "dashboard"):
+        return "web"
+    return "api"
+
+
+def source_from(user: dict, request: Any = None) -> str:
+    """Traffic source in {web, api, sdk, mcp, extension, cli, n8n}.
+
+    Thin wrapper over ``surface_from_request`` that extracts key_type from
+    the auth ``user`` dict and the User-Agent / Origin headers from the
+    request. Header access is guarded because analytics must never raise
+    into the request path.
     """
     key_type = (user or {}).get("key_type", "")
     ua = ""
     origin = ""
     if request is not None:
         try:
-            ua = (request.headers.get("user-agent", "") or "").lower()
+            ua = request.headers.get("user-agent", "") or ""
             origin = request.headers.get("origin", "") or ""
         except Exception:  # noqa: BLE001 — header access must never raise here
             ua = ""
             origin = ""
-    if origin.startswith("chrome-extension://") or "enconvert-extension" in ua:
-        return "extension"
-    if "mcp" in ua:
-        return "mcp"
-    if "enconvert-sdk" in ua or "python-sdk" in ua or "node-sdk" in ua:
-        return "sdk"
-    if key_type in ("public", "dashboard"):
-        return "web"
-    return "api"
+    return surface_from_request(key_type, ua, origin)
 
 
 def converter_module_of(fn: Any) -> str:

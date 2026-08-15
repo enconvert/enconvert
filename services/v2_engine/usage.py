@@ -1,10 +1,14 @@
-"""V2 usage counters and storage accounting (Task F.5).
+"""V2 usage recording and storage accounting (Task F.5; unified ops 029).
 
-Coexistence rule 3 (V3 plan section 5): V2 quotas are SEPARATE counters
-on ch_usage_periods — a /v2/perceive success bumps perceive_operations
-and never touches V1's conversions_used. Rule 7 keeps shared utilities
-read-only from V2, so the write-side lives here in v2_engine instead of
-inside utils/subscription.py.
+Since migration 029 every V2 op bills THE unified counter
+(ch_usage_periods.ops_used) through the single ledgered choke point
+utils.usage_ledger.record_op_usage; the per-endpoint columns
+(perceive_operations, lookup_queries, distill_operations, ingest_pages)
+survive only as telemetry BREAKDOWNS bumped in the same atomic UPDATE.
+The increment_* wrappers here keep the flow-facing surface stable and own
+the per-endpoint idempotency-key shapes. Coexistence rule 7 still keeps
+V2 write-paths in v2_engine: the LLM reserve/settle two-phase writes live
+here, not in utils/.
 
 Storage accounting mirrors the V1 policy in monitoring/metrics.py:
 output bytes count toward project.storage_used, the usage-period peak
@@ -15,6 +19,7 @@ scheduled for retention cleanup.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
@@ -25,6 +30,7 @@ from sqlmodel import select
 from models import Project, UsagePeriod
 from utils.postgres import get_db
 from utils.subscription import update_storage_peak
+from utils.usage_ledger import record_op_usage
 
 logger = logging.getLogger(__name__)
 
@@ -84,23 +90,43 @@ def get_period_llm_spend_cents(project_id: int) -> Optional[Decimal]:
 def reserve_llm_budget(
     project_id: int,
     reserve_cents: Decimal,
-    cap_cents: Decimal,
+    cap_cents: Optional[Decimal] = None,
     *,
     idempotency_key: str = "",
+    unlimited: bool = False,
 ) -> Optional[int]:
-    """Atomically gate AND book ``reserve_cents`` against the period cap
-    (F.6 How step 6, hardened for concurrency; ledgered per migration 016).
+    """Atomically gate AND book ``reserve_cents`` against the period's AI
+    credits (F.6 How step 6, hardened for concurrency; ledgered per 016).
+
+    PERIOD CEILING (contract, migration 029): the period cap is the row's
+    own ``ai_credits_granted_cents`` — the plan's monthly AI-credit grant
+    (subscription override wins) plus full rollover of the previous
+    period's unspent credits, materialized at period creation. The old
+    slug-keyed $5/$20 constants no longer gate anything at period level.
+    Remaining credits = ai_credits_granted_cents - llm_cost_cents.
+
+    ``cap_cents`` survives for the existing callers but is a PER-REQUEST
+    ceiling only: a reservation larger than it fails closed (returns
+    None, no API call). Pass None to skip that check.
+
+    ``unlimited=True`` (admin projects: ADMIN_SUBSCRIPTION has no real
+    plan row, so its periods carry 0 granted credits) still BOOKS the
+    cost and writes the ledger row but skips the credit ceiling —
+    replacing the pre-029 slug-keyed elevated cap that kept admin LLM
+    extraction usable. Callers must derive it from plan_slug == "admin"
+    only; paying plans always gate on their credits.
 
     A SINGLE conditional UPDATE — ``SET llm_cost_cents = llm_cost_cents +
-    :reserve WHERE <current period> AND llm_cost_cents + :reserve <=
-    :cap`` — so the cap check and the booking commit together. No
-    read-then-act window exists: N concurrent callers cannot collectively
-    exceed the cap, because each one's reservation only succeeds while
-    headroom remains. Returns the reserved period's primary key (so the
-    caller can settle against that exact row), or None when no current
-    period exists OR the reservation would breach the cap. Booking the
-    worst-case cost up front and reconciling down (settle_llm_cost) bounds
-    total period spend to the cap even under a crash between the two.
+    :reserve WHERE <period row> AND llm_cost_cents + :reserve <=
+    ai_credits_granted_cents`` — so the credit check and the booking
+    commit together. No read-then-act window exists: N concurrent callers
+    cannot collectively exceed the credits, because each one's reservation
+    only succeeds while headroom remains. Returns the reserved period's
+    primary key (so the caller can settle against that exact row), or None
+    when no current period exists OR the reservation would breach the
+    credits. Booking the worst-case cost up front and reconciling down
+    (settle_llm_cost) bounds total period spend to the credits even under
+    a crash between the two.
 
     ``idempotency_key`` (the caller's per-extract-call usage key) writes a
     ``v2:llm:reserve:{key}`` ledger row in the SAME transaction as the
@@ -111,6 +137,9 @@ def reserve_llm_budget(
     unledgered behavior (kept for direct callers/tests; prod callers
     always pass one).
     """
+    if cap_cents is not None and reserve_cents > cap_cents:
+        # Per-request ceiling breached — never book, never call.
+        return None
     db = get_db()
     try:
         now = datetime.now(timezone.utc)
@@ -157,12 +186,17 @@ def reserve_llm_budget(
             where_clause = (UsagePeriod.id == ledger_period_id,)
         else:
             where_clause = _current_period_clause(project_id, now)
+        if not unlimited:
+            # Column-vs-column on the SAME row: the materialized
+            # credit grant is the ceiling (migration 029).
+            where_clause = (
+                *where_clause,
+                UsagePeriod.llm_cost_cents + reserve_cents
+                <= UsagePeriod.ai_credits_granted_cents,
+            )
         result = db.execute(
             update(UsagePeriod)
-            .where(
-                *where_clause,
-                UsagePeriod.llm_cost_cents + reserve_cents <= cap_cents,
-            )
+            .where(*where_clause)
             .values(
                 llm_cost_cents=UsagePeriod.llm_cost_cents + reserve_cents,
                 updated_at=now,
@@ -171,8 +205,8 @@ def reserve_llm_budget(
         )
         row = result.first()
         if row is None:
-            # Cap reached: roll back so the ledger row vanishes WITH the
-            # booking it would have described.
+            # Credits exhausted: roll back so the ledger row vanishes WITH
+            # the booking it would have described.
             db.rollback()
             return None
         db.commit()
@@ -258,77 +292,130 @@ def settle_llm_cost(
         db.close()
 
 
-# V2 usage counters this module is allowed to bump. A whitelist keeps the
-# dynamic setattr below from ever touching an arbitrary attribute.
-_INCREMENTABLE_COUNTERS = frozenset(
-    {
-        "perceive_operations",
-        "lookup_queries",
-        "ingest_pages",
-        "watch_checks",
-        "distill_operations",
-    }
-)
+def _record_v2_op(
+    project_id: int,
+    *,
+    prefix: str,
+    event_type: str,
+    breakdown: Optional[str],
+    idempotency_key: Optional[str],
+    count: int,
+) -> None:
+    """Bill ``count`` ops through the unified ledger choke point.
 
+    Every V2 op is Tier-1 money since migration 029: the write goes
+    through utils.usage_ledger.record_op_usage (ledger row gates the
+    aggregate bump of ops_used + the per-endpoint breakdown column in ONE
+    transaction). ``idempotency_key`` is the caller's NATURAL id
+    (operation_id, '{job_id}:{md5(url)[:16]}', ...) which this helper
+    folds into the contract key shape 'v2:op:<endpoint>:<natural id>'; a
+    key already carrying the 'v2:op:' prefix is used verbatim so callers
+    that build the full key stay correct. None falls back to uuid4 —
+    still ledgered for audit, just never deduplicable, so a retried call
+    double-counts exactly like the pre-ledger code (accepted where no
+    natural id is threadable to the increment site).
 
-def _increment_period_counter(project_id: int, counter: str, count: int) -> None:
-    """Bump a single ch_usage_periods V2 counter for the current period.
-
-    ONE atomic ``UPDATE ... SET counter = counter + :n`` — the same
-    row-lock shape as reserve_llm_budget — replacing the old
-    read-in-Python/+=/write-back, which lost updates when two operations
-    for one project completed concurrently. Tier-2 counters are quota
-    gates with no overage billing, so there is deliberately NO ledger row
-    and NO idempotency key here (the migration-016 CHECK constraint
-    enforces that ledger rows exist only for the two money counters).
-
-    There is no V2 overage concept (hard 402 at the limit, enforced
-    before the operation in api.deps.check_v2_quota); a missing current
-    period is a no-op, matching utils.subscription.increment_conversion_usage.
+    A missing current period stays a logged no-op inside record_op_usage
+    (pre-existing behavior; the rotation poller is the fix).
     """
-    if counter not in _INCREMENTABLE_COUNTERS:
-        raise ValueError(f"unknown usage counter: {counter!r}")
-    db = get_db()
-    try:
-        now = datetime.now(timezone.utc)
-        column = getattr(UsagePeriod, counter)
-        db.execute(
-            update(UsagePeriod)
-            .where(*_current_period_clause(project_id, now))
-            .values(**{counter: column + count, "updated_at": now})
-        )
-        db.commit()
-    finally:
-        db.close()
+    if idempotency_key is None:
+        key = f"{prefix}unkeyed:{uuid.uuid4().hex}"
+    elif idempotency_key.startswith("v2:op:"):
+        key = idempotency_key
+    else:
+        key = f"{prefix}{idempotency_key}"
+    record_op_usage(
+        project_id=project_id,
+        idempotency_key=key,
+        event_type=event_type,
+        units=count,
+        breakdown=breakdown,
+    )
 
 
-def increment_perceive_usage(project_id: int, count: int = 1) -> None:
-    """Bump ch_usage_periods.perceive_operations for the current period."""
-    _increment_period_counter(project_id, "perceive_operations", count)
+def increment_perceive_usage(
+    project_id: int, idempotency_key: Optional[str] = None, count: int = 1
+) -> None:
+    """Bill perceive ops (1/URL; cache hits bill — existing behavior).
+    Natural key: the operation id -> 'v2:op:perceive:{operation_id}'."""
+    _record_v2_op(
+        project_id,
+        prefix="v2:op:perceive:",
+        event_type="v2_perceive",
+        breakdown="perceive_operations",
+        idempotency_key=idempotency_key,
+        count=count,
+    )
 
 
-def increment_lookup_usage(project_id: int, count: int = 1) -> None:
-    """Bump ch_usage_periods.lookup_queries for the current period (H.3)."""
-    _increment_period_counter(project_id, "lookup_queries", count)
+def increment_lookup_usage(
+    project_id: int, idempotency_key: Optional[str] = None, count: int = 1
+) -> None:
+    """Bill lookup ops (H.3): 1/query, PLUS the auto-perceive enrichment
+    ops billed separately through increment_perceive_usage (compounding
+    kept — founder decision 2026-08-13)."""
+    _record_v2_op(
+        project_id,
+        prefix="v2:op:lookup:",
+        event_type="v2_lookup",
+        breakdown="lookup_queries",
+        idempotency_key=idempotency_key,
+        count=count,
+    )
 
 
-def increment_distill_usage(project_id: int, count: int = 1) -> None:
-    """Bump ch_usage_periods.distill_operations for the period (H.5).
+def increment_distill_usage(
+    project_id: int, idempotency_key: Optional[str] = None, count: int = 1
+) -> None:
+    """Bill distill ops (H.5): one per COMPLETED URL (the handler reserves
+    a fast units gate; the flow re-checks per URL and bills here only for
+    URLs that completed, so our own render failures never bill the
+    caller). Natural key: '{operation_id}:{md5(url)[:16]}'."""
+    _record_v2_op(
+        project_id,
+        prefix="v2:op:distill:",
+        event_type="v2_distill",
+        breakdown="distill_operations",
+        idempotency_key=idempotency_key,
+        count=count,
+    )
 
-    One distill operation == one URL distilled (the handler reserves a
-    fast units=1 gate; the flow re-checks per URL and increments here only
-    for URLs that completed, so our own render failures never bill the
-    caller)."""
-    _increment_period_counter(project_id, "distill_operations", count)
+
+def increment_ingest_usage(
+    project_id: int, idempotency_key: Optional[str] = None, count: int = 1
+) -> None:
+    """Bill ingest ops (H.7): one per page whose render + chunk + JSONL
+    stage completed (the flow bills only completed pages, so our own
+    render failures never bill the caller). Natural key:
+    '{job_id}:{md5(url)[:16]}'."""
+    _record_v2_op(
+        project_id,
+        prefix="v2:op:ingest:",
+        event_type="v2_ingest",
+        breakdown="ingest_pages",
+        idempotency_key=idempotency_key,
+        count=count,
+    )
 
 
-def increment_ingest_usage(project_id: int, count: int = 1) -> None:
-    """Bump ch_usage_periods.ingest_pages for the current period (H.7).
-
-    One ingest page == one URL whose render + chunk + JSONL stage completed
-    (the flow increments here only for completed pages, so our own render
-    failures never bill the caller)."""
-    _increment_period_counter(project_id, "ingest_pages", count)
+def increment_discover_usage(
+    project_id: int, idempotency_key: Optional[str] = None
+) -> None:
+    """Bill /v2/discover: 1 op per call (deliberate change with migration
+    029 — discover was previously uncounted). No breakdown column exists
+    for discover, so only the unified ops_used moves; the ledger row
+    (event_type='v2_discover') is the per-endpoint audit trail. Discover
+    has no natural operation id, so the default key is uuid4-based
+    ('v2:op:discover:{uuid4}' per the contract) — per-call billing, no
+    dedup possible or needed."""
+    _record_v2_op(
+        project_id,
+        prefix="v2:op:discover:",
+        event_type="v2_discover",
+        breakdown=None,
+        idempotency_key=idempotency_key,
+        count=1,
+    )
 
 
 def record_storage_and_retention(

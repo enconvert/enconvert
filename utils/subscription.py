@@ -1,6 +1,5 @@
 """Subscription lookup and feature gating helpers."""
 import logging
-import uuid
 from datetime import datetime, timezone
 from sqlalchemy import update
 from sqlmodel import select
@@ -16,7 +15,12 @@ logger = logging.getLogger(__name__)
 # instead would deny V2 features the submit handler already accepted.
 ADMIN_SUBSCRIPTION: dict = {
     "plan_slug": "admin",
-    "conversion_limit": 999999,
+    # Unified ops (migration 029): 0 = unlimited (check_ops_quota also
+    # bypasses outright on plan_slug == "admin").
+    "ops_month": 0,
+    "effective_ops_month": 0,
+    "ai_credits_cents_month": 0,
+    "override_ai_credits_cents_month": None,
     "max_file_size": 999999999,
     "file_retention_hours": 99999,
     "batch_limit": 99999,
@@ -29,17 +33,13 @@ ADMIN_SUBSCRIPTION: dict = {
     "widget_branding": False,
     "overage_enabled": False,
     "overage_allowed": False,
-    # V2: admin gets everything, unlimited (0 = unlimited when the flag is
-    # TRUE; check_v2_quota also bypasses on plan_slug == "admin").
+    # V2 endpoint flags: admin gets everything (max_watchers 0 = unlimited
+    # when the flag is TRUE, migration 011 convention).
     "perceive_enabled": True,
-    "perceive_operations_month": 0,
     "discover_enabled": True,
     "lookup_enabled": True,
-    "lookup_queries_month": 0,
     "distill_enabled": True,
-    "distill_operations_month": 0,
     "ingest_enabled": True,
-    "ingest_pages_month": 0,
     "watch_enabled": True,
     "max_watchers": 0,
     "llm_extraction_enabled": True,
@@ -70,6 +70,18 @@ def get_subscription(project_id: int) -> dict | None:
                 select(StoragePlan).where(StoragePlan.id == sub.storage_plan_id)
             ).first()
 
+        # Effective unified ops limit (migration 029): the override wins,
+        # then the materialized effective column, then the plan cap. The
+        # NULLIF-style middle step matters: effective_ops_month is 0 on
+        # subscription rows created between the 029 apply and this build's
+        # deploy, and falling through to plan.ops_month self-heals those
+        # without a backfill. A RESOLVED 0 means unlimited (enterprise
+        # convention).
+        if sub.override_ops_month is not None:
+            effective_ops_month = sub.override_ops_month
+        else:
+            effective_ops_month = sub.effective_ops_month or plan.ops_month
+
         return {
             "subscription_id": sub.id,
             "project_id": sub.project_id,
@@ -78,11 +90,17 @@ def get_subscription(project_id: int) -> dict | None:
             "status": sub.status,
             "overage_enabled": sub.overage_enabled,
             # Effective limits (use these for gating)
-            "conversion_limit": sub.effective_conversion_limit,
+            "effective_ops_month": effective_ops_month,
+            "ops_month": plan.ops_month,
             "max_file_size": sub.effective_max_file_size,
             "file_retention_hours": sub.effective_file_retention_hours,
             "batch_limit": sub.effective_batch_limit,
             "storage_bytes": sub.effective_storage_bytes,
+            # AI credits (migration 029): these two feed the period's
+            # ai_credits_granted_cents at creation time; the LLM budget
+            # gate reads the materialized period column, not this dict.
+            "ai_credits_cents_month": plan.ai_credits_cents_month,
+            "override_ai_credits_cents_month": sub.override_ai_credits_cents_month,
             # Plan features (boolean flags)
             "has_async_mode": plan.has_async_mode,
             "has_webhook": plan.has_webhook,
@@ -94,19 +112,15 @@ def get_subscription(project_id: int) -> dict | None:
             "storage_management": plan.storage_management,
             "overage_rate_cents": plan.overage_rate_cents,
             "overage_allowed": plan.overage_allowed,
-            # V2 plan gates + quotas (migration 011, Sprint F.4/F.5).
-            # Additive keys only — V1 consumers of this dict are
-            # unaffected. Quota = 0 with the flag TRUE means unlimited
-            # (enterprise convention documented in migration 011).
+            # V2 endpoint flags: pure kill-switches since migration 029
+            # (the per-endpoint monthly caps were replaced by the unified
+            # ops cap and dropped by migration 030). max_watchers stays a
+            # real cap — persistent resource, not consumption.
             "perceive_enabled": plan.perceive_enabled,
-            "perceive_operations_month": plan.perceive_operations_month,
             "discover_enabled": plan.discover_enabled,
             "lookup_enabled": plan.lookup_enabled,
-            "lookup_queries_month": plan.lookup_queries_month,
             "distill_enabled": plan.distill_enabled,
-            "distill_operations_month": plan.distill_operations_month,
             "ingest_enabled": plan.ingest_enabled,
-            "ingest_pages_month": plan.ingest_pages_month,
             "watch_enabled": plan.watch_enabled,
             "max_watchers": plan.max_watchers,
             "llm_extraction_enabled": plan.llm_extraction_enabled,
@@ -154,39 +168,6 @@ def get_current_usage_period(project_id: int) -> UsagePeriod | None:
         ).first()
     finally:
         db.close()
-
-
-def increment_conversion_usage(
-    project_id: int, count: int = 1, idempotency_key: str | None = None
-):
-    """Count ``count`` conversions against the current usage period,
-    exactly once per ``idempotency_key``.
-
-    Ledger + aggregate (migration 016): the write goes through
-    utils.usage_ledger.record_conversion_usage — an append-only ledger
-    row gates an atomic aggregate UPDATE in one transaction, replacing
-    the old read-modify-write (which lost updates under concurrency)
-    AND the old separate limit read (overage now derives in the same
-    statement, under the same row lock).
-
-    ``idempotency_key`` should be deterministic for the logical event
-    (the V1 caller passes ``v1:conversion:{activity_id}``). A missing
-    key gets a UUID fallback — still ledgered, just never deduplicable,
-    so retries of such calls double-count exactly like the old code.
-    """
-    from utils.usage_ledger import record_conversion_usage
-
-    key = idempotency_key or f"v1:conversion:unkeyed:{uuid.uuid4().hex}"
-    if idempotency_key is None:
-        logger.warning(
-            "increment_conversion_usage called without idempotency_key "
-            "for project %s — using non-deduplicable fallback %s",
-            project_id,
-            key,
-        )
-    record_conversion_usage(
-        project_id=project_id, idempotency_key=key, count=count
-    )
 
 
 def update_storage_peak(project_id: int, current_storage_used: int):
@@ -247,7 +228,10 @@ def recompute_effective_limits(plan_id: int):
         ).all()
         now = datetime.now(timezone.utc)
         for sub in subs:
-            sub.effective_conversion_limit = sub.override_conversion_limit if sub.override_conversion_limit is not None else plan.conversion_limit
+            # Materialize the unified ops cap (migration 029) — the read
+            # path still falls back to plan.ops_month when this is 0, so a
+            # stale 0 here degrades gracefully rather than blocking anyone.
+            sub.effective_ops_month = sub.override_ops_month if sub.override_ops_month is not None else plan.ops_month
             sub.effective_max_file_size = sub.override_max_file_size if sub.override_max_file_size is not None else plan.max_file_size
             sub.effective_file_retention_hours = sub.override_file_retention_hours if sub.override_file_retention_hours is not None else plan.file_retention_hours
             sub.effective_batch_limit = sub.override_batch_limit if sub.override_batch_limit is not None else plan.batch_limit

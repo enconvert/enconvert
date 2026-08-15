@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
-from api.deps import check_conversion_limit, check_storage_limit, check_feature_access, check_batch_limit, check_crawl_access
+from api.deps import check_ops_quota, check_storage_limit, check_feature_access, check_batch_limit, check_crawl_access
 from monitoring import posthog_client
 from monitoring.metrics import (
     log_activity_start, log_batch_activity_start, update_activity_status,
@@ -624,9 +624,9 @@ async def discover_website_urls(
     1. User's subscription crawl_mode (none / sitemap / full)
     2. Requested crawl_mode from request body (auto / sitemap / full)
 
-    - Starter plans (crawl_mode="sitemap"): sitemap-only discovery
-    - Pro/Business plans (crawl_mode="full"): full algorithmic crawl (sitemap + Crawlee BFS)
-    - Free plans (crawl_mode="none"): blocked by check_crawl_access
+    - Indie plans (crawl_mode="sitemap"): sitemap-only discovery
+    - Studio/Production plans (crawl_mode="full"): full algorithmic crawl (sitemap + Crawlee BFS)
+    - Founding plans (crawl_mode="none"): blocked by check_crawl_access
 
     Returns:
         (urls, discovery_method, total_discovered)
@@ -711,8 +711,8 @@ async def handle_url_conversion(
     # Validate optional per-request render knobs.
     validate_render_options(data)
 
-    # Check conversion limit with full batch size
-    check_conversion_limit(user, url_count=len(urls))
+    # Check the unified ops quota with the full batch size (1 op per URL)
+    check_ops_quota(user, units=len(urls))
     check_storage_limit(user)
 
     # Feature gates for private key features

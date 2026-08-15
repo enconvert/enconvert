@@ -6,7 +6,7 @@ import asyncio
 import json as json_lib
 import os
 
-from api.deps import check_abuse_patterns, check_rate_limits, check_conversion_limit, check_storage_limit, check_feature_access, get_current_user, validate_file_size, check_crawl_access, check_batch_limit
+from api.deps import check_abuse_patterns, check_rate_limits, check_ops_quota, check_storage_limit, check_feature_access, get_current_user, validate_file_size, check_crawl_access, check_batch_limit
 
 from monitoring.metrics import log_activity_start, log_batch_activity_start, update_activity_status
 from monitoring import posthog_client
@@ -262,7 +262,7 @@ async def forward_to_backend(
             so a route only passes kwargs its own converter accepts.
     """
 
-    check_conversion_limit(user)
+    check_ops_quota(user)
     check_storage_limit(user)
 
     # Extension gate (declared type) followed by a conservative content
@@ -693,7 +693,7 @@ async def website_to_pdf(
     urls, discovery_method, total_discovered = await discover_website_urls(data, user, notification_email, base_url)
 
     check_batch_limit(user, len(urls))
-    check_conversion_limit(user, url_count=len(urls))
+    check_ops_quota(user, units=len(urls))
     check_storage_limit(user)
 
     batch_id = str(uuid.uuid4())
@@ -760,7 +760,7 @@ async def website_to_screenshot(
     urls, discovery_method, total_discovered = await discover_website_urls(data, user, notification_email, base_url)
 
     check_batch_limit(user, len(urls))
-    check_conversion_limit(user, url_count=len(urls))
+    check_ops_quota(user, units=len(urls))
     check_storage_limit(user)
 
     batch_id = str(uuid.uuid4())

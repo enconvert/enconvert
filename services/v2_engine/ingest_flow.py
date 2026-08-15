@@ -49,7 +49,7 @@ from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from fastapi import HTTPException
 
-from api.deps import check_v2_quota
+from api.deps import check_ops_quota
 from api.v2.schemas.discover import DiscoverRequest
 from api.v2.schemas.ingest import (
     IngestJobResponse,
@@ -486,16 +486,16 @@ async def process_job(job_id: str) -> None:
             continue
 
         try:
-            # check_v2_quota opens a sync DB session (current usage period) —
+            # check_ops_quota opens a sync DB session (current usage period) —
             # offload it so the event loop is never blocked per page.
-            await asyncio.to_thread(check_v2_quota, user, "ingest_pages", 1)
+            await asyncio.to_thread(check_ops_quota, user, 1)
         except HTTPException as exc:
-            # Keep the real denial (plan gate vs monthly limit) — it is our
-            # own client-safe 402 text and _assemble surfaces it on the job.
+            # Keep the real denial — it is our own client-safe 402 text and
+            # _assemble surfaces it on the job.
             quota_denied = (
                 exc.detail
                 if isinstance(exc.detail, str)
-                else "ingest page quota exhausted"
+                else "monthly ops quota exhausted"
             )
             await asyncio.to_thread(ingest_store.skip_page, page.id, quota_denied)
             failed += 1
@@ -511,7 +511,15 @@ async def process_job(job_id: str) -> None:
                 sentence_overlap=sentence_overlap,
                 render=render_cfg,
             )
-            await asyncio.to_thread(usage.increment_ingest_usage, job.project_id)
+            # job_id + hashed page URL (or object key for file pages) is
+            # unique per page, so a worker crash-and-resume that re-processes
+            # a page bills it exactly once at the ledger.
+            page_digest = hashlib.md5(page.url.encode("utf-8")).hexdigest()[:16]
+            await asyncio.to_thread(
+                usage.increment_ingest_usage,
+                job.project_id,
+                idempotency_key=f"v2:op:ingest:{job_id}:{page_digest}",
+            )
             processed += 1
             chunks_total += chunk_count
         except asyncio.CancelledError:

@@ -11,6 +11,8 @@ from utils.postgres import get_db
 from utils.validators import is_domain_allowed
 from utils.subscription import get_project_owner_email
 from utils.email_notifier import send_api_key_unauthorized_domain_email
+from auth.usage_stamp import stamp_api_key_usage
+from monitoring.posthog_client import surface_from_request
 
 logger = logging.getLogger("conversion-api-gateway")
 
@@ -132,15 +134,40 @@ def validate_api_key(api_key: str, request: Request) -> dict:
     )).first()
     plan = db.exec(select(Plan).where(Plan.id == sub.plan_id)).first() if sub else None
     plan_slug = plan.slug if plan else "free"
+
+    # Capture everything the response needs into plain values BEFORE the
+    # usage stamp: the stamp commits (or rolls back) the session, which
+    # expires ORM instances, and the return dict must never depend on live
+    # ORM state after that point.
+    api_key_id = key_data.id
+    project_id = key_data.project_id
+    allowed_domains = key_data.allowed_domains or []
+    allowed_endpoints = key_data.allowed_endpoints or []
+
+    # Activation stamp (migration 031) — LAST, after every other query, and
+    # double-wrapped: stamp_api_key_usage never raises by contract, and this
+    # guard also covers surface classification so no failure here can turn a
+    # valid key into a 500.
+    try:
+        surface = surface_from_request(
+            key_type,
+            request.headers.get("User-Agent", "") or "",
+            origin or "",
+        )
+        stamp_api_key_usage(db, api_key_id, surface)
+    except Exception:
+        logger.warning("API key usage stamp skipped (key_id=%s)", api_key_id, exc_info=True)
+
     db.close()
 
-    logger.info(f"API key auth successful: project={key_data.project_id}, plan={plan_slug}, key_type={key_type}")
+    logger.info(f"API key auth successful: project={project_id}, plan={plan_slug}, key_type={key_type}")
 
     return {
-        "id": str(key_data.project_id),
+        "id": str(project_id),
         "tier": plan_slug,  # backward compat
         "plan_slug": plan_slug,
         "key_type": key_type,
-        "allowed_domains": key_data.allowed_domains or [],
-        "allowed_endpoints": key_data.allowed_endpoints or [],
+        "api_key_id": api_key_id,
+        "allowed_domains": allowed_domains,
+        "allowed_endpoints": allowed_endpoints,
     }

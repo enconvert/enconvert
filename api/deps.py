@@ -39,6 +39,7 @@ from monitoring import posthog_client
 from sqlmodel import select
 from utils.postgres import get_db
 from utils.subscription import ADMIN_SUBSCRIPTION, get_subscription, get_current_usage_period, is_admin_default_project, get_project_owner_email, is_project_owner_active
+from utils.usage_ledger import _ensure_current_period
 from utils.email_notifier import send_quota_reached_email
 from rate_limiting.limiter import enforce as enforce_rate_limits
 
@@ -260,10 +261,15 @@ def _attach_subscription(user: dict):
     if sub:
         user["subscription"] = sub
     else:
-        # Fallback: no subscription found, use free defaults
+        # Fallback: no subscription found, use Founding (free) defaults —
+        # mirror the migration-029 reseed exactly.
         user["subscription"] = {
             "plan_slug": "free",
-            "conversion_limit": 100,
+            # Unified ops cap (migration 029): Founding gets 500 ops/month.
+            "ops_month": 500,
+            "effective_ops_month": 500,
+            "ai_credits_cents_month": 0,
+            "override_ai_credits_cents_month": None,
             "max_file_size": 5242880,
             "file_retention_hours": 1,
             "batch_limit": 0,
@@ -276,16 +282,14 @@ def _attach_subscription(user: dict):
             "widget_branding": True,
             "overage_enabled": False,
             "overage_allowed": False,
-            # V2: mirror the migration-012 free-plan defaults.
+            # Endpoint flags are kill-switches since migration 029: the
+            # whole surface is on for every tier except the two real gates
+            # (watch + LLM extraction stay off on free/beta).
             "perceive_enabled": True,
-            "perceive_operations_month": 50,
             "discover_enabled": True,
             "lookup_enabled": True,
-            "lookup_queries_month": 25,
-            "distill_enabled": False,
-            "distill_operations_month": 0,
-            "ingest_enabled": False,
-            "ingest_pages_month": 0,
+            "distill_enabled": True,
+            "ingest_enabled": True,
             "watch_enabled": False,
             "max_watchers": 0,
             "llm_extraction_enabled": False,
@@ -342,12 +346,12 @@ def check_storage_limit(user: dict):
 
 
 def _maybe_alert_quota_reached(project_id: int, used: int, limit: int, plan_slug: str) -> None:
-    """Best-effort, throttled (once/24h) owner alert when the monthly conversion
-    quota hits 100%. Runs only on the limit-reached path, so the extra DB read
-    and email send never touch a normal (under-limit) request. The email itself
-    (owner lookup + Brevo HTTP) runs on a daemon thread — this function is
-    called synchronously inside async route handlers, and a blocking send here
-    would stall the single-worker event loop."""
+    """Best-effort, throttled (once/24h) owner alert when the monthly unified
+    ops quota hits 100%. Runs only on the limit-reached path, so the extra DB
+    read and email send never touch a normal (under-limit) request. The email
+    itself (owner lookup + Brevo HTTP) runs on a daemon thread — this function
+    is called synchronously inside async route handlers, and a blocking send
+    here would stall the single-worker event loop."""
     try:
         db = get_db()
         try:
@@ -383,14 +387,50 @@ def _maybe_alert_quota_reached(project_id: int, used: int, limit: int, plan_slug
         logger.exception("Failed to send quota-reached alert")
 
 
-def check_conversion_limit(user: dict, url_count: int = 1):
-    """
-    Enforce monthly conversion limits based on subscription.
-    Accepts url_count to pre-check batch jobs against the remaining quota.
+def check_ops_quota(user: dict, units: int = 1):
+    """Enforce THE unified monthly ops quota (migration 029) — replaces both
+    check_conversion_limit (V1) and check_v2_quota (per-endpoint V2 caps).
+
+    ``units`` is the number of ops this request will consume (1 per unit of
+    work: per conversion/URL/page/query; batch submitters pre-check their
+    whole batch). The limit is the RESOLVED effective ops cap — the
+    subscription dict already applies COALESCE(override_ops_month,
+    NULLIF(effective_ops_month, 0), plan.ops_month) in
+    utils.subscription.get_subscription — and a resolved 0 means unlimited
+    (enterprise/admin convention). Denials are 402: the remedy is always
+    "upgrade". Every paid plan (Indie/Studio/Production) carries
+    overage_allowed at $0.02 per op; a subscription that opted in
+    (overage_enabled, off by default) passes the gate instead and is billed
+    per op. Free is a hard cap and enterprise is negotiated, so neither
+    plan allows overage.
+
+    Per-endpoint *_enabled flags are NOT checked here — they survive as
+    kill-switch feature gates (check_v2_feature) applied by the route
+    BEFORE this gate.
+
+    Missing usage period: previously a silent allow (ungated AND
+    uncounted). Now the period is provisioned on the spot from the
+    subscription's declared window via
+    utils.usage_ledger._ensure_current_period (the billing rotation's own
+    INSERT), and when provisioning is impossible — no ch_subscriptions
+    row at all — the gate fails CLOSED with 402: a project with no
+    billing relationship must not run ops for free.
+
+    KNOWN TOLERANCE (unchanged from both predecessors): this read and the
+    post-completion increment (utils.usage_ledger.record_op_usage) are
+    separate statements, so N requests racing at the boundary can overshoot
+    the cap by up to N-1. Ops are seconds-long and per-project concurrency
+    is low, so the bound is tiny; closing it fully needs an optimistic
+    reserve+rollback, deferred to avoid the worse failure of an uncounted
+    (free) completed op.
     """
     sub = user.get("subscription", {})
     if sub.get("plan_slug") == "admin":
         return
+
+    limit = int(sub.get("effective_ops_month", 0) or 0)
+    if limit <= 0:
+        return  # 0 = unlimited (enterprise convention, migration 029)
 
     try:
         project_id = int(user.get("id"))
@@ -399,42 +439,60 @@ def check_conversion_limit(user: dict, url_count: int = 1):
 
     usage = get_current_usage_period(project_id)
     if not usage:
+        # Provision the missing period instead of the old silent allow.
+        # Committed in its own short transaction: the fresh row must be
+        # visible to the re-read below and to the post-completion ledger
+        # write regardless of this request's outcome.
+        db = get_db()
+        try:
+            provisioned = _ensure_current_period(
+                db, project_id, datetime.now(timezone.utc)
+            )
+            db.commit()
+        finally:
+            db.close()
+        if provisioned is not None:
+            usage = get_current_usage_period(project_id)
+        if not usage:
+            # No subscription window to provision from — fail CLOSED.
+            raise HTTPException(
+                status_code=402,
+                detail="No active billing period found for this project. "
+                       "Contact support to restore your subscription."
+            )
+
+    used = int(usage.ops_used or 0)
+    if used + units <= limit:
         return
 
-    limit = sub.get("conversion_limit", 100)
-    used = usage.conversions_used
-    remaining = limit - used
+    # Over the cap: an opted-in subscription on any overage-allowed paid plan
+    # passes (billed at overage_rate_cents per op by the billing rotation).
+    if sub.get("overage_allowed") and sub.get("overage_enabled"):
+        return
 
-    if remaining <= 0:
-        # Check if overage is allowed and enabled
-        if sub.get("overage_allowed") and sub.get("overage_enabled"):
-            return  # Allow overage (will be billed)
-        _gate_capture(user, "conversion_limit_reached", {
-            "conversions_used": used,
-            "conversion_limit": limit,
-            "plan_tier": sub.get("plan_slug", "free"),
-            "url_count": url_count,
-        })
+    _gate_capture(user, "ops_limit_reached", {
+        "ops_used": used,
+        "ops_limit": limit,
+        "plan_tier": sub.get("plan_slug", "free"),
+        "units": units,
+    })
+
+    if used >= limit:
+        # Quota fully consumed: alert the owner (throttled) at 100%.
         _maybe_alert_quota_reached(project_id, used, limit, sub.get("plan_slug", "free"))
         raise HTTPException(
             status_code=402,
-            detail=f"Monthly conversion limit reached ({used}/{limit}). Upgrade your plan to continue."
+            detail=f"Monthly operations limit reached ({used}/{limit}). "
+                   "Upgrade your plan to continue."
         )
 
-    if url_count > remaining:
-        if sub.get("overage_allowed") and sub.get("overage_enabled"):
-            return  # Allow overage (will be billed)
-        _gate_capture(user, "conversion_limit_reached", {
-            "conversions_used": used,
-            "conversion_limit": limit,
-            "plan_tier": sub.get("plan_slug", "free"),
-            "url_count": url_count,
-        })
-        raise HTTPException(
-            status_code=402,
-            detail=f"Batch of {url_count} URLs would exceed your monthly limit. "
-                   f"You have {remaining} conversions remaining out of {limit}."
-        )
+    remaining = limit - used
+    raise HTTPException(
+        status_code=402,
+        detail=f"This request needs {units} operations but only {remaining} "
+               f"of your {limit} monthly operations remain. "
+               "Upgrade your plan to continue."
+    )
 
 
 def check_abuse_patterns(
@@ -518,99 +576,16 @@ def validate_file_size(
         )
 
 
-# V2 quota registry (Task F.5; later sprints add lookup/distill/ingest/
-# watch rows). Maps a ch_usage_periods counter to its ch_plans gate flag
-# and monthly-limit column. Per migration 011's documented convention,
-# limit == 0 with the flag TRUE means UNLIMITED (enterprise).
-V2_QUOTAS: dict = {
-    "perceive_operations": {
-        "flag": "perceive_enabled",
-        "limit_key": "perceive_operations_month",
-        "label": "Perceive",
-    },
-    "lookup_queries": {
-        "flag": "lookup_enabled",
-        "limit_key": "lookup_queries_month",
-        "label": "Lookup",
-    },
-    "distill_operations": {
-        "flag": "distill_enabled",
-        "limit_key": "distill_operations_month",
-        "label": "Distill",
-    },
-    "ingest_pages": {
-        "flag": "ingest_enabled",
-        "limit_key": "ingest_pages_month",
-        "label": "Ingest",
-    },
-}
-
-
-def check_v2_quota(user: dict, counter: str, units: int = 1):
-    """Enforce the V2 plan gate AND the monthly quota for `counter`.
-
-    Both denials are 402 per plan Task F.5 verification (d)/(e) — the
-    fix is the same either way: upgrade to a V2-inclusive plan. (V1's
-    check_feature_access answers 403 for V1 features; the F.5 playbook
-    pins 402 for V2, so V2 enforcement lives here, separately.)
-
-    ``units`` is the number of operations this request will consume
-    (F.8: one per batch URL). The default of 1 preserves the original
-    single-operation semantics exactly (used + 1 > limit == used >= limit).
-    """
-    sub = user.get("subscription", {})
-    if sub.get("plan_slug") == "admin":
-        return
-
-    spec = V2_QUOTAS[counter]
-    label = spec["label"]
-
-    if not sub.get(spec["flag"], False):
-        raise HTTPException(
-            status_code=402,
-            detail=f"{label} is not available on your current plan. "
-            "Upgrade to a V2-inclusive plan to access this endpoint."
-        )
-
-    limit = int(sub.get(spec["limit_key"], 0) or 0)
-    if limit <= 0:
-        return  # 0 + enabled flag = unlimited (migration 011 convention)
-
-    try:
-        project_id = int(user.get("id"))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Project not found")
-
-    usage = get_current_usage_period(project_id)
-    if not usage:
-        return
-
-    # KNOWN TOLERANCE (matches V1 check_conversion_limit): this read and
-    # the post-render increment in services.v2_engine.usage are separate
-    # statements, so N requests racing at the boundary can overshoot the
-    # cap by up to N-1. Renders are seconds-long and per-project
-    # concurrency is low, so the bound is tiny; closing it fully needs an
-    # optimistic reserve+rollback, deferred to keep V1 parity and avoid
-    # the worse failure of an uncounted (free) completed render.
-    used = int(getattr(usage, counter, 0) or 0)
-    if used + units > limit:
-        needed = f" This request needs {units} operations." if units > 1 else ""
-        raise HTTPException(
-            status_code=402,
-            detail=f"Monthly {label} limit reached ({used}/{limit}).{needed} "
-            "Upgrade your plan to continue."
-        )
-
-
 def check_v2_feature(user: dict, flag: str, label: str) -> None:
-    """Gate a V2 endpoint on a boolean plan flag with NO quota counter.
+    """Gate a V2 endpoint on its boolean plan flag (kill-switch).
 
-    ``/v2/discover`` (Task H.1) is the first such endpoint: it is cheap
-    (HTTP-only, no browser, no Spaces artifact) and has no per-operation
-    counter on ch_usage_periods, so check_v2_quota does not fit. The
-    denial is 402 to match the F.5 V2-gate convention (V1 feature gates
-    answer 403 via check_feature_access; V2 gates answer 402 — the
-    remedy is the same: upgrade to a V2-inclusive plan). Admin bypasses.
+    Since migration 029 the per-endpoint monthly caps are gone — the
+    unified ops quota (check_ops_quota) is the only consumption gate —
+    but the *_enabled flags survive as kill-switches, checked BEFORE the
+    ops gate. The denial is 402 to match the F.5 V2-gate convention (V1
+    feature gates answer 403 via check_feature_access; V2 gates answer
+    402 — the remedy is the same: upgrade to a V2-inclusive plan). Admin
+    bypasses.
     """
     sub = user.get("subscription", {})
     if sub.get("plan_slug") == "admin":
@@ -631,14 +606,15 @@ def check_v2_feature(user: dict, flag: str, label: str) -> None:
 def check_watcher_quota(user: dict, active_count: int) -> None:
     """Gate POST /v2/watch on the plan flag AND the concurrent watcher cap.
 
-    Unlike the monthly counters in ``check_v2_quota``, ``max_watchers`` limits
-    how many ACTIVE watchers a project may hold at once, so the caller passes
-    the current active count. Both denials are 402 to match the F.5 V2-gate
+    Unlike the consumption counter in ``check_ops_quota``, ``max_watchers``
+    limits how many ACTIVE watchers a project may hold at once (watchers cost
+    ZERO ops — this cap is the only watch gate), so the caller passes the
+    current active count. Both denials are 402 to match the F.5 V2-gate
     convention (the remedy is the same: upgrade). Per the migration 011
     convention, ``max_watchers == 0`` with the flag TRUE means UNLIMITED
     (enterprise/admin). Admin bypasses entirely.
 
-    KNOWN TOLERANCE (matches check_v2_quota): the count read and the insert are
+    KNOWN TOLERANCE (matches check_ops_quota): the count read and the insert are
     separate statements, so requests racing at the boundary can overshoot the
     cap by up to N-1. Per-project concurrency on this endpoint is low, so the
     bound is tiny; an optimistic reserve is deferred.
@@ -728,5 +704,5 @@ def check_crawl_access(user: dict, crawl_type: str):
     if crawl_type == "full" and crawl_mode == "sitemap":
         raise HTTPException(
             status_code=403,
-            detail="Full website crawling requires a Pro plan or higher. Your plan supports sitemap-based crawling only."
+            detail="Full website crawling requires a Studio plan or higher. Your plan supports sitemap-based crawling only."
         )

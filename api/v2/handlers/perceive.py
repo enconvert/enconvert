@@ -1,11 +1,12 @@
 """POST /v2/perceive (Task F.5) + /v2/perceive/batch (Task F.8).
 
-Thin handlers per the coding rules: auth, plan gate + quota (both 402,
-F.5 verification d/e), request validation, activity logging — then they
-delegate to services.v2_engine (perceive_flow / batch_worker). V1's
-activity table is reused for dashboard visibility, but with
-``count_usage=False`` so a V2 operation can never consume V1 conversion
-quota (coexistence rule 3); the V2 counter is bumped inside the flow.
+Thin handlers per the coding rules: auth, kill-switch flag gate + unified
+ops quota (both 402, F.5 verification d/e), request validation, activity
+logging — then they delegate to services.v2_engine (perceive_flow /
+batch_worker). V1's activity table is reused for dashboard visibility, but
+with ``count_usage=False`` so the activity path never double-bills: the
+unified ops counter is bumped exactly once inside the flow (idempotent
+record_op_usage choke point).
 
 F.8 (no-GCP revision): batches of <= 10 URLs run inline and answer 200
 with full results; larger batches answer 202 with a job_id and are
@@ -23,7 +24,12 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import ValidationError
 
-from api.deps import check_batch_limit, check_v2_quota, get_current_user
+from api.deps import (
+    check_batch_limit,
+    check_ops_quota,
+    check_v2_feature,
+    get_current_user,
+)
 from monitoring import posthog_client
 from api.v2.schemas.perceive import (
     OutputArtifact,
@@ -99,7 +105,9 @@ async def perceive(
     (metadata rides in X- headers) — no second fetch to a signed URL.
     """
     _validate_direct_download(body)
-    check_v2_quota(user, "perceive_operations")
+    # Kill-switch flag first, then the unified ops gate (one op per URL).
+    check_v2_feature(user, "perceive_enabled", "Perceive")
+    check_ops_quota(user)
     _reject_unsupported(body)
     validate_auth_cookies_headers(
         {
@@ -218,7 +226,10 @@ async def perceive_batch(
             "?direct_download=true.",
         )
     check_batch_limit(user, len(requests))
-    check_v2_quota(user, "perceive_operations", units=len(requests))
+    # Kill-switch flag, then pre-reserve one op per batch URL against the
+    # unified monthly ops cap (founder decision 2026-08-13).
+    check_v2_feature(user, "perceive_enabled", "Perceive")
+    check_ops_quota(user, units=len(requests))
     _reject_unsupported(body.options)
     validate_auth_cookies_headers(
         {

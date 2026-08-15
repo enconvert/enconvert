@@ -442,7 +442,7 @@ def send_quota_reached_email(
     used: int,
     limit: int,
 ) -> bool:
-    """Notify the project owner their monthly conversion quota hit 100%.
+    """Notify the project owner their unified monthly ops quota hit 100%.
     Best-effort; the caller throttles this to once/24h per project."""
     if not BREVO_API_KEY:
         logger.error("BREVO_API_KEY not set")
@@ -454,11 +454,11 @@ def send_quota_reached_email(
         <html><body style="font-family:Arial,sans-serif;color:#333;">
           <div style="max-width:600px;margin:0 auto;padding:20px;">
             <div style="background:#d29922;color:#fff;padding:20px;text-align:center;border-radius:5px 5px 0 0;">
-              <h2>Monthly conversion limit reached</h2>
+              <h2>Monthly operations limit reached</h2>
             </div>
             <div style="background:#f9f9f9;padding:20px;border-radius:0 0 5px 5px;">
-              <p>Your project has used <strong>{int(used)}</strong> of its <strong>{int(limit)}</strong> monthly conversions on the {safe_plan} plan.</p>
-              <p>Further conversions are blocked (HTTP 402) until your quota resets or you upgrade.</p>
+              <p>Your project has used <strong>{int(used)}</strong> of its <strong>{int(limit)}</strong> monthly operations on the {safe_plan} plan.</p>
+              <p>Further operations are blocked (HTTP 402) until your quota resets or you upgrade.</p>
               <div style="text-align:center;margin:18px 0;">
                 <a href="https://www.enconvert.com/dashboard/billing" style="display:inline-block;padding:10px 18px;background:#143459;color:#fff;text-decoration:none;border-radius:5px;">Upgrade plan</a>
               </div>
@@ -471,7 +471,7 @@ def send_quota_reached_email(
         """
         _send_brevo(
             recipient_email,
-            "You've hit your monthly conversion limit – EnConvert",
+            "You've hit your monthly operations limit – EnConvert",
             html_content,
         )
         logger.info("Quota-reached alert sent")
@@ -556,39 +556,6 @@ def _billing_shell(header: str, header_color: str, body_html: str) -> str:
     """
 
 
-def send_trial_ending_email(
-    recipient_email: str,
-    plan_name: str,
-    trial_end_str: str,
-    days_left: int,
-) -> bool:
-    """Remind the owner that their trial converts to a paid plan soon."""
-    if not BREVO_API_KEY:
-        logger.error("BREVO_API_KEY not set")
-        return False
-    try:
-        safe_plan = html.escape(plan_name)
-        safe_end = html.escape(trial_end_str)
-        day_word = "day" if days_left == 1 else "days"
-        body = f"""
-          <p>Your <strong>{safe_plan}</strong> plan trial ends in
-          <strong>{int(days_left)} {day_word}</strong> (on {safe_end}).</p>
-          <p>When the trial ends, your plan price will be charged to your
-          payment method automatically. If you do not want to continue, you
-          can cancel any time before then from your dashboard.</p>
-        """
-        _send_brevo(
-            recipient_email,
-            "Your EnConvert trial ends soon",
-            _billing_shell("Trial ending soon", "#143459", body),
-        )
-        logger.info("Trial-ending reminder sent")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send trial-ending reminder: {e}")
-        return False
-
-
 def send_storage_lapse_warning_email(
     recipient_email: str,
     project_name: str,
@@ -629,7 +596,7 @@ def send_overage_receipt_email(
     currency: str,
     charged_on_str: str,
     plan_name: str,
-    overage_conversions: Optional[int] = None,
+    overage_ops: Optional[int] = None,
 ) -> bool:
     """Receipt for a captured pay-as-you-go overage charge.
 
@@ -645,13 +612,13 @@ def send_overage_receipt_email(
         safe_date = html.escape(charged_on_str)
         safe_plan = html.escape(plan_name)
         count_line = (
-            f"<p>Overage conversions billed: <strong>{int(overage_conversions)}</strong></p>"
-            if overage_conversions is not None
+            f"<p>Overage operations billed: <strong>{int(overage_ops)}</strong></p>"
+            if overage_ops is not None
             else ""
         )
         body = f"""
           <p>We charged <strong>{safe_amount} {safe_currency}</strong> on
-          {safe_date} for pay-as-you-go conversions used beyond your
+          {safe_date} for pay-as-you-go operations used beyond your
           <strong>{safe_plan}</strong> plan's monthly quota.</p>
           {count_line}
           <p>The full payment history is available in your dashboard.</p>
@@ -673,7 +640,7 @@ def send_renewal_notice_email(
     plan_name: str,
     period_start_str: str,
     period_end_str: str,
-    conversion_limit: int,
+    ops_limit: int,
 ) -> bool:
     """Notify the owner that a new billing period started (quota reset)."""
     if not BREVO_API_KEY:
@@ -687,8 +654,8 @@ def send_renewal_notice_email(
           <p>A new billing period started for your <strong>{safe_plan}</strong>
           plan.</p>
           <p>Period: <strong>{safe_start}</strong> to <strong>{safe_end}</strong></p>
-          <p>Your monthly quota of <strong>{int(conversion_limit)}</strong>
-          conversions has been reset. Your plan price is billed by PayPal on
+          <p>Your monthly quota of <strong>{int(ops_limit)}</strong>
+          operations has been reset. Your plan price is billed by PayPal on
           your regular subscription schedule.</p>
         """
         _send_brevo(

@@ -49,7 +49,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
+
+from utils.url_registrable import registered_domain_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,15 @@ BOILERPLATE_SELECTORS: str = ", ".join(
         "[id*=cookie-banner]",
         "[class*=announcement-bar]",
         "[class*=newsletter]",
+        # Page-rating widgets ("Was this page helpful? Yes/No"). The
+        # buttons themselves are removed by markdown_prep; this takes
+        # the prompt paragraph that would otherwise be left stranded.
+        "[class*=feedback]",
+        "[id*=feedback]",
+        # Docusaurus/Mintlify heading self-anchors, whose label is a
+        # zero-width space.
+        ".hash-link",
+        ".anchor-link",
     )
 )
 
@@ -195,7 +206,10 @@ def extract_main_content(html: str) -> MainContentResult:
         # _protected_article_header.
         for tag_name in BOILERPLATE_TAGS:
             for tag in base_soup.find_all(tag_name):
+                if tag.decomposed:
+                    continue
                 if tag_name == "header" and _protected_article_header(tag):
+                    _trim_header_labels(tag)
                     continue
                 tag.decompose()
 
@@ -206,12 +220,21 @@ def extract_main_content(html: str) -> MainContentResult:
         # took down. Nodes that CONTAIN the content region (streaming-SSR
         # hidden wrappers) are never removed — see _contains_content_region.
         try:
+            deferred = controlled_ids(base_soup)
             for tag in base_soup.select(BOILERPLATE_SELECTORS):
                 if tag.decomposed or _contains_content_region(tag):
+                    continue
+                # A collapsed tab panel inside the content region is
+                # deferred CONTENT, not chrome: the [aria-hidden] and
+                # [hidden] selectors above would otherwise delete the
+                # inactive half of every tabbed code sample.
+                if is_deferred_disclosure(tag, deferred):
                     continue
                 tag.decompose()
         except Exception:  # noqa: BLE001 — selector engine failure
             logger.warning("boilerplate selector pass failed", exc_info=True)
+
+        _prune_link_farms(base_soup, words_before)
 
         stripped = str(base_soup)
         words_after = _visible_word_count(BeautifulSoup(stripped, "lxml"))
@@ -238,6 +261,35 @@ def extract_main_content(html: str) -> MainContentResult:
                                  stripped_html=html)
 
 
+# --- Off-site tool/share widget pruning -------------------------------------
+#
+# Some pages park a link hub INSIDE the content region: arXiv's abstract
+# page keeps Google Scholar / NASA ADS / DBLP / BibSonomy / Reddit
+# widgets inside <main>, as a sibling of the paper itself. No semantic
+# tag marks it, so the tag and selector passes cannot see it.
+#
+# The discriminating signal is where the links POINT, and nothing else.
+# Link DENSITY was tried first and measured as unsafe on real pages:
+#   * arXiv's tool sidebar scores 0.62 link-words/words — and the paper's
+#     AUTHOR LIST directly above it scores 0.67, so no density threshold
+#     separates them;
+#   * a 62-row "document loaders" reference table on the LangChain docs
+#     scores 0.98, and pruning by density deleted it outright.
+# Pointing at many unrelated sites, with almost no prose per link, is
+# what a "find this elsewhere" bar does and what a content block does
+# not: an author list or a docs card grid links to its own site, and a
+# genuine further-reading list carries descriptive text per entry.
+#
+# Tables are exempt unconditionally. Tabular data is content by
+# construction — the LangChain table above is 23 external domains at one
+# word per link, which is to say: indistinguishable from a share bar by
+# every metric except being a table.
+_LINKFARM_TAGS: tuple[str, ...] = ("div", "section", "ul", "ol", "dl")
+_LINKFARM_MIN_LINKS: int = 6
+_LINKFARM_MAX_PROSE_SHARE: float = 0.25
+_SHARE_MIN_DOMAINS: int = 4
+_SHARE_MAX_WORDS_PER_LINK: float = 4.0
+
 # Minimum visible words for a semantic main region to be worth proposing
 # as a candidate — below this the region is a stub (an empty SPA <main>
 # shell) and would only lose the election anyway.
@@ -260,6 +312,48 @@ _BASELINE_CHROME_SELECTORS: tuple[str, ...] = (
     "[role=banner]",
     "[role=contentinfo]",
 )
+
+
+# Roles that mark DEFERRED content — a closed tab, a collapsed section —
+# rather than chrome. Docs sites ship the Python example in the active
+# tab and the JavaScript one in an inert sibling; both are content, and
+# dropping the inactive one made the extracted page depend on which tab
+# happened to be selected at render time.
+_DEFERRED_ROLES: frozenset[str] = frozenset({"tabpanel", "region"})
+
+
+def controlled_ids(soup: BeautifulSoup) -> set[str]:
+    """Every element id referenced by an ``aria-controls`` on the page."""
+    ids: set[str] = set()
+    try:
+        for tag in soup.find_all(attrs={"aria-controls": True}):
+            value = tag.get("aria-controls") or ""
+            if isinstance(value, list):
+                value = " ".join(str(item) for item in value)
+            ids.update(str(value).split())
+    except Exception:  # noqa: BLE001 — an unusable index, not an error
+        logger.warning("aria-controls scan failed", exc_info=True)
+    return ids
+
+
+def is_deferred_disclosure(tag: Any, controlled: set[str]) -> bool:
+    """True for a collapsed tab/section that holds deferred CONTENT.
+
+    Requires the node to sit inside the semantic content region, so a
+    closed mega-menu in the site header — which frameworks also mark
+    ``aria-hidden`` — is still treated as chrome.
+    """
+    try:
+        role = (tag.get("role") or "").strip().lower()
+        tag_id = tag.get("id")
+        is_panel = role in _DEFERRED_ROLES or (
+            bool(tag_id) and str(tag_id) in controlled
+        )
+        if not is_panel:
+            return False
+        return _inside_main_region(tag)
+    except Exception:  # noqa: BLE001 — treat as chrome on any parse quirk
+        return False
 
 
 def _inside_main_region(tag: Any) -> bool:
@@ -298,6 +392,44 @@ def _contains_content_region(tag: Any) -> bool:
 _ARTICLE_HEADER_MAX_LINKS: int = 4
 
 
+_HEADING_TAGS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
+
+# Inside a protected article header, a short text block BEFORE the title
+# is a breadcrumb trail, an eyebrow ("Get started"), or a category
+# label — navigation, not the article. Anything longer than this is a
+# standfirst/subtitle and stays. Blocks AFTER the title are never
+# touched, which is where subtitles normally live.
+_EYEBROW_MAX_WORDS: int = 8
+
+
+def _trim_header_labels(header: Any) -> None:
+    """Drop breadcrumb/eyebrow blocks preceding an article's title.
+
+    Called only for headers ``_protected_article_header`` kept. Those
+    headers earn protection by carrying the page title, but modern docs
+    themes put the breadcrumb trail in the same element — with no
+    ``nav``, no ``aria-label`` and no ``breadcrumb`` class to match on
+    (verified on two Mintlify sites), so only its POSITION identifies
+    it.
+    """
+    try:
+        heading = header.find(_HEADING_TAGS)
+        if heading is None:
+            return
+        for child in header.children:
+            if not isinstance(child, Tag) or child.decomposed:
+                continue
+            if child is heading or heading in child.descendants:
+                return  # reached the title; everything after it stays
+            if child.find(("pre", "table", "img")) is not None:
+                continue
+            text = child.get_text(" ", strip=True)
+            if text and len(text.split()) <= _EYEBROW_MAX_WORDS:
+                child.decompose()
+    except Exception:  # noqa: BLE001 — trimming is best-effort
+        logger.warning("header label trim failed", exc_info=True)
+
+
 def _protected_article_header(tag: Any) -> bool:
     """True for a ``<header>`` that is an article's own title block.
 
@@ -316,6 +448,60 @@ def _protected_article_header(tag: Any) -> bool:
         return len(tag.find_all("a")) <= _ARTICLE_HEADER_MAX_LINKS
     except Exception:  # noqa: BLE001 — treat as chrome on any parse quirk
         return False
+
+
+def _is_share_widget(tag: Any, links: list, words: int) -> bool:
+    """True for a 'find/share this elsewhere' bar (see ``_SHARE_*``).
+
+    Counts DISTINCT registrable domains among absolute link targets.
+    Relative and same-site links collapse to nothing/one domain, so a
+    docs card grid or an author list can never reach the threshold —
+    only a block pointing at many unrelated sites can.
+    """
+    del tag  # signature kept uniform with the other block predicates
+    if words / max(len(links), 1) > _SHARE_MAX_WORDS_PER_LINK:
+        return False
+    domains: set[str] = set()
+    for link in links:
+        href = (link.get("href") or "").strip()
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        domain = registered_domain_from_url(href)
+        if domain:
+            domains.add(domain)
+    return len(domains) >= _SHARE_MIN_DOMAINS
+
+
+def _prune_link_farms(soup: BeautifulSoup, total_words: int) -> None:
+    """Remove in-content off-site tool/share widgets (see ``_LINKFARM_*``).
+
+    Runs as part of the guarded strip, so an over-eager prune costs the
+    candidate the election rather than the page. Never touches a block
+    that contains the semantic content region or a table.
+    """
+    try:
+        for tag in soup.find_all(_LINKFARM_TAGS):
+            if tag.decomposed:
+                continue
+            links = tag.find_all("a")
+            if len(links) < _LINKFARM_MIN_LINKS:
+                continue
+            if _contains_content_region(tag):
+                continue
+            if tag.find("table") is not None:
+                continue  # tabular data is content, whatever it links to
+            words = len(tag.get_text(" ").split())
+            if words == 0:
+                continue
+            if (
+                total_words > 0
+                and words / total_words > _LINKFARM_MAX_PROSE_SHARE
+            ):
+                continue  # too big to be a widget; this may be the page
+            if _is_share_widget(tag, links, words):
+                tag.decompose()
+    except Exception:  # noqa: BLE001 — pruning is best-effort
+        logger.warning("link-farm pruning failed", exc_info=True)
 
 
 def guard_baseline_html(html: str) -> str:
@@ -433,6 +619,39 @@ _CODE_BLOCK_RETENTION: float = 0.6
 
 _LINK_MD_RE = re.compile(r"!?\[([^\]]*)\]\(([^)]*)\)")
 
+# --- Heading integrity ------------------------------------------------------
+#
+# A candidate that keeps a section's BODY but loses its HEADING has
+# corrupted the document, and the prose-word metric cannot see it: a
+# heading is two or three short words against thousands of body words.
+# This is exactly how Readability failed on the QA corpus — it kept
+# every paragraph of platform.claude.com and dropped six of its nine
+# heading texts, which is where the bare "##" lines came from.
+#
+# The test is deliberately narrow: a heading counts as ORPHANED only
+# when the candidate lost the heading text but KEPT the body that
+# followed it. Legitimate chrome removal takes a heading and its section
+# together and is therefore never penalised — which matters, because
+# some pages carry real headings inside widgets we want gone (arXiv's
+# "Bibliographic Tools").
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_EMPTY_HEADING_LINE_RE = re.compile(r"^#{1,6}\s*$")
+
+# Lines scanned after a heading for a body probe, and the probe's
+# minimum length in words (short lines match too easily by accident).
+_HEADING_BODY_LOOKAHEAD: int = 6
+_HEADING_BODY_MIN_WORDS: int = 5
+
+# Orphaned headings tolerated before a candidate is disqualified. One
+# can be a formatting quirk; two is a pattern.
+_MAX_ORPHANED_HEADINGS: int = 2
+
+# An orphaned H1 is the page's TITLE — losing it while keeping the
+# article is on its own enough to disqualify a candidate. Readability
+# does exactly this on docs hubs: it kept every paragraph of the
+# LlamaIndex front page and dropped "Welcome to LlamaIndex".
+_ORPHANED_H1_WEIGHT: int = _MAX_ORPHANED_HEADINGS
+
 
 @dataclass(frozen=True)
 class ContentCandidate:
@@ -548,6 +767,68 @@ def _nav_line_count(lines: list[str]) -> int:
     return sum(1 for line in lines if _is_nav_line(line))
 
 
+def _empty_heading_count(lines: list[str]) -> int:
+    """Headings the candidate emitted with no text (``##`` alone)."""
+    return sum(1 for line in lines if _EMPTY_HEADING_LINE_RE.match(line))
+
+
+def _flatten_text(line: str) -> str:
+    """One markdown line reduced to comparable plain text."""
+    text = _LINK_MD_RE.sub(lambda m: m.group(1), line)
+    text = re.sub(r"[`*_#>|~\[\]]", " ", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _heading_probes(lines: list[str]) -> list[tuple[int, str, str]]:
+    """``(level, heading text, body probe)`` for every heading found.
+
+    The body probe is the first substantial line under the heading and
+    before the next one — the evidence that this section survived.
+    """
+    probes: list[tuple[int, str, str]] = []
+    for index, line in enumerate(lines):
+        match = _HEADING_LINE_RE.match(line)
+        if not match:
+            continue
+        level = len(match.group(1))
+        heading = _flatten_text(match.group(2))
+        if len(heading) < 3:
+            continue
+        body = ""
+        window = lines[index + 1 : index + 1 + _HEADING_BODY_LOOKAHEAD]
+        for follower in window:
+            if _HEADING_LINE_RE.match(follower):
+                break
+            probe = _flatten_text(follower)
+            if len(probe.split()) >= _HEADING_BODY_MIN_WORDS:
+                body = probe
+                break
+        if body:
+            probes.append((level, heading, body))
+    return probes
+
+
+def _orphaned_heading_count(
+    lines: list[str], probes: list[tuple[int, str, str]]
+) -> int:
+    """Weighted count of headings the candidate orphaned.
+
+    A heading is orphaned when the candidate KEPT the section's body but
+    LOST its title — the signature of a lossy article extractor, and
+    invisible to the prose-word metric. Removing a heading together
+    with its section (ordinary chrome stripping) scores zero.
+    """
+    if not probes:
+        return 0
+    blob = " ".join(_flatten_text(line) for line in lines)
+    score = 0
+    for level, heading, body in probes:
+        if heading in blob or body not in blob:
+            continue
+        score += _ORPHANED_H1_WEIGHT if level == 1 else 1
+    return score
+
+
 def select_main_content(
     candidates: list[ContentCandidate],
     full_page_markdown: str,
@@ -565,18 +846,26 @@ def select_main_content(
     When omitted, the full page doubles as the baseline (the original
     behavior, kept for callers/tests that pass two arguments).
 
-    Selection: among candidates retaining >= RETENTION_FLOOR of the
-    baseline's prose words (and its code blocks), minimise the ABSOLUTE
-    number of nav-chrome lines; ties go to the shorter text. The count
-    (not the ratio) is deliberate: on link-hub pages whose content IS
-    links, stripping non-link chrome (footer taglines, search boxes)
-    RAISED the ratio and handed the election to the unstripped page.
+    Eligibility has three gates, each guarding a different kind of
+    damage a clean-looking extraction can do: prose retention
+    (``RETENTION_FLOOR``), code-block retention
+    (``_CODE_BLOCK_RETENTION``), and heading integrity
+    (``_MAX_ORPHANED_HEADINGS`` — a candidate that keeps a section but
+    drops its title is disqualified).
+
+    Selection: among eligible candidates, minimise the ABSOLUTE number
+    of junk lines (nav chrome plus text-less headings); ties go to the
+    shorter text. The count (not the ratio) is deliberate: on link-hub
+    pages whose content IS links, stripping non-link chrome (footer
+    taglines, search boxes) RAISED the ratio and handed the election to
+    the unstripped page.
     """
     baseline_lines = _lines(
         baseline_markdown if baseline_markdown else full_page_markdown
     )
     baseline_words = _prose_words(baseline_lines)
     baseline_blocks = _code_blocks(baseline_lines)
+    baseline_probes = _heading_probes(baseline_lines)
 
     scored: list[SelectedContent] = []
     for candidate in candidates:
@@ -588,6 +877,11 @@ def select_main_content(
             < _CODE_BLOCK_RETENTION
         ):
             continue  # dropped the page's code blocks — never eligible
+        if (
+            _orphaned_heading_count(lines, baseline_probes)
+            >= _MAX_ORPHANED_HEADINGS
+        ):
+            continue  # kept the sections, lost their titles
         words = _prose_words(lines)
         retention = (
             len(words & baseline_words) / len(baseline_words)
@@ -628,8 +922,10 @@ def select_main_content(
 
     eligible = [e for e in scored if e.retention >= RETENTION_FLOOR]
     eligible.append(full_page)
-    winner = min(
-        eligible,
-        key=lambda e: (_nav_line_count(_lines(e.markdown)), len(e.markdown)),
-    )
-    return winner
+
+    def _junk_score(entry: SelectedContent) -> tuple[int, int]:
+        lines = _lines(entry.markdown)
+        junk = _nav_line_count(lines) + _empty_heading_count(lines)
+        return junk, len(entry.markdown)
+
+    return min(eligible, key=_junk_score)
