@@ -44,6 +44,18 @@ MIN_MAX_WORDS = 32
 MAX_MAX_WORDS = 4000
 MAX_SENTENCE_OVERLAP = 10
 
+# A heading is a LABEL, not a sentence. CommonMark puts no length bound on
+# ATX heading text, so a converter that emits a whole document on one line
+# beginning with "# " (what an HTML->Markdown pass does to a text/plain body
+# whose newlines it collapsed) yields a single multi-thousand-word "heading"
+# — which is a section BOUNDARY here, so it both swallows the document and
+# poisons every following chunk's headings_path. Anything past this many
+# words is prose that merely starts with '#'. The bound is deliberately far
+# above real headings (the widest heading across a 21-page, 4-vendor docs
+# corpus is 9 words; English sentences average 15-20) and far below the
+# degenerate cases it exists to catch (200-9000+ words).
+MAX_HEADING_WORDS = 32
+
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
 _LIST_ITEM_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+\S")
@@ -140,6 +152,28 @@ def parse_blocks(markdown: str) -> List[_Block]:
     blocks: List[_Block] = []
     paragraph: List[str] = []
 
+    # Longest fence run of each marker at or after every line. An opening
+    # fence can only be closed by a LATER line of the same marker whose run
+    # is at least as long (CommonMark), so this answers "is there any
+    # possible closer?" in O(1) instead of a scan to end-of-document.
+    #
+    # Without it, a body of fence openers with strictly decreasing run
+    # lengths is quadratic: every opener scans the whole remaining document,
+    # fails, and re-parses from the next line, which is another full scan.
+    # That is cheap to construct and used to be unreachable (a text/plain
+    # body was newline-collapsed before it got here); a verbatim body makes
+    # it reachable, and this runs on the worker's event loop.
+    suffix_max: List[dict[str, int]] = [{} for _ in range(len(lines) + 1)]
+    for index in range(len(lines) - 1, -1, -1):
+        carried = dict(suffix_max[index + 1])
+        fence_here = _FENCE_RE.match(lines[index])
+        if fence_here:
+            marker = fence_here.group(2)[0]
+            run = len(fence_here.group(2))
+            if run > carried.get(marker, 0):
+                carried[marker] = run
+        suffix_max[index] = carried
+
     def flush_paragraph() -> None:
         if paragraph:
             text = "\n".join(paragraph).strip()
@@ -160,9 +194,16 @@ def parse_blocks(markdown: str) -> List[_Block]:
 
         fence = _FENCE_RE.match(line)
         if fence:
-            flush_paragraph()
             marker = fence.group(2)[0]  # ` or ~
             open_len = len(fence.group(2))  # CommonMark: closing fence >= this
+            if suffix_max[index + 1].get(marker, 0) < open_len:
+                # No later line can close this fence — skip the scan and
+                # treat the opener as ordinary text, exactly as the
+                # unclosed-fence branch below would have after scanning.
+                paragraph.append(line)
+                index += 1
+                continue
+            flush_paragraph()
             fence_start = index
             buffer = [line]
             index += 1
@@ -190,12 +231,15 @@ def parse_blocks(markdown: str) -> List[_Block]:
             continue
 
         heading = _HEADING_RE.match(line)
-        if heading:
+        if heading and count_words(heading.group(2)) <= MAX_HEADING_WORDS:
             flush_paragraph()
             level = len(heading.group(1))
             blocks.append(_Block("heading", heading.group(2).strip(), level))
             index += 1
             continue
+        # An over-long "heading" is prose that happens to start with '#'
+        # (see MAX_HEADING_WORDS): fall through to the paragraph branch so
+        # the text is chunked normally instead of becoming a section title.
 
         # Table: a pipe row immediately followed by a separator row.
         if "|" in line and index + 1 < total and _is_table_separator(lines[index + 1]):
@@ -367,7 +411,10 @@ def chunk_markdown(
             of the same section (0 disables overlap).
 
     Returns:
-        Chunks in document order. Empty / heading-only input yields ``[]``.
+        Chunks in document order. Only genuinely empty / whitespace-only
+        input yields ``[]`` — a document made entirely of headings (a
+        table-of-contents or title-only page) is emitted by the
+        no-chunks-at-all safety net below rather than silently dropped.
     """
     # The pure chunker honours the caller's size (>= 1 word); API-facing
     # bounds (MIN/MAX_MAX_WORDS) are enforced upstream in ChunkOptions.
@@ -408,6 +455,33 @@ def chunk_markdown(
                     text=text,
                     headings_path=headings_path,
                     section=section,
+                    word_count=count_words(text),
+                )
+            )
+
+    if not chunks and blocks:
+        # Every h1-h3 section was body-less, so the per-section loop emitted
+        # nothing at all: the document is a pure heading outline (a
+        # table-of-contents or a title-only page). Heading text normally
+        # lives in metadata rather than in a chunk body — correct when the
+        # section HAS a body, silent total data loss when none of them does
+        # (a completed ingest job whose deliverable is an empty file).
+        # Re-run the packer over every block as ONE unstructured section so
+        # non-empty markdown always produces at least one chunk. Per-section
+        # skipping is unchanged: this only fires when the whole document
+        # produced zero chunks.
+        atoms = []
+        for block_index, block in enumerate(blocks):
+            if block.kind == "heading":
+                atoms.append(_Atom("line", block.text, block_index))
+            else:
+                atoms.extend(_atoms_for_block(block, block_index))
+        for text in _pack_atoms(atoms, max_words, sentence_overlap):
+            chunks.append(
+                Chunk(
+                    text=text,
+                    headings_path=(),
+                    section="",
                     word_count=count_words(text),
                 )
             )

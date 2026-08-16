@@ -54,6 +54,14 @@ class RenderResult:
     # F.5: /v2/perceive can request the viewport screenshot alongside
     # the full-page one; V1 converters never set this.
     screenshot_viewport_bytes: Optional[bytes] = None
+    # Non-HTML navigation results (``text/plain``, ``application/json``).
+    # ``html`` then holds the DECODED BODY VERBATIM, not markup: a
+    # downstream HTML->Markdown pass would collapse its newlines and
+    # destroy the document (a 99 KB llms.txt became one 99 KB line, which
+    # then chunked to nothing). Consumers must check this before treating
+    # ``html`` as HTML. None = an ordinary HTML page.
+    content_category: Optional[str] = None
+    raw_content_type: Optional[str] = None
 
 
 _results: Dict[CarrierKey, RenderResult] = {}
@@ -89,6 +97,22 @@ def stash_page_html(url: str, request_id: str, html: str, final_url: str) -> Non
     entry = _results.setdefault((url, request_id), RenderResult())
     entry.html = html
     entry.final_url = final_url
+
+
+def stash_content_category(
+    url: str,
+    request_id: str,
+    category: Optional[str],
+    raw_content_type: Optional[str],
+) -> None:
+    """Record that the navigation returned a non-HTML body (from a hook).
+
+    Paired with ``stash_page_html``, whose ``html`` argument then carries
+    the decoded body verbatim rather than markup.
+    """
+    entry = _results.setdefault((url, request_id), RenderResult())
+    entry.content_category = category
+    entry.raw_content_type = raw_content_type
 
 
 def pop_result(url: str, request_id: str) -> Optional[RenderResult]:

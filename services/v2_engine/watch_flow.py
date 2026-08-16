@@ -262,7 +262,10 @@ async def run_check(claimed: ClaimedWatcher) -> None:
 
     try:
         capture = await asyncio.to_thread(
-            _build_capture, page.html or "", page.final_url or str(claimed.url)
+            _build_capture,
+            page.html or "",
+            page.final_url or str(claimed.url),
+            content_category=page.content_category,
         )
         content_hash = await asyncio.to_thread(_capture_hash, capture)
         diff = await _diff_against_baseline(claimed, capture)
@@ -497,10 +500,34 @@ async def _diff_against_baseline(
     )
 
 
-def _build_capture(html: str, final_url: str) -> Capture:
+def _build_capture(
+    html: str, final_url: str, *, content_category: Optional[str] = None
+) -> Capture:
     """Extract the diffable capture (main-content text + structure) from a
     render. CPU-bound (bs4 parse) — the caller offloads it to a worker thread,
-    mirroring perceive_flow._process_outputs."""
+    mirroring perceive_flow._process_outputs.
+
+    ``content_category`` is set when the watched URL answers with a non-HTML
+    body (``text/plain``, ``application/json``); ``html`` is then that body
+    VERBATIM. Running the HTML pipeline over it would let a bare ``<`` in the
+    payload swallow everything after it, so the whole watched document is
+    diffed as text and no DOM structure is claimed for it. A JSON API
+    endpoint is exactly the kind of URL people watch, so this path has to be
+    lossless."""
+    if content_category is not None:
+        text = html
+        if len(text) > MAX_CAPTURE_TEXT_CHARS:
+            text = text[:MAX_CAPTURE_TEXT_CHARS]
+        return Capture(
+            text=text,
+            structured={
+                "metadata": {},
+                "tables": [],
+                "links": {"internal": [], "external": []},
+                "structured_data": [],
+            },
+        )
+
     scraping = scrap_html(final_url, html)
     try:
         text = generate_fit_markdown(html, final_url).decode("utf-8", "replace")

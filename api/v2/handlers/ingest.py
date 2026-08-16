@@ -138,6 +138,25 @@ async def ingest(
     return ingest_flow.job_response(job)
 
 
+async def _pages_for_warnings(job) -> Optional[list]:
+    """Page rows for ``job_response``'s duplicate note, or None.
+
+    Only a terminal job can carry the note, and clients stop polling once a
+    job is terminal, so this costs roughly one extra read per job rather
+    than one per poll. Offloaded, like every other store call here — a
+    synchronous query would block the loop the ingest worker shares.
+    """
+    if not ingest_flow.wants_duplicate_scan(job):
+        return None
+    try:
+        return await asyncio.to_thread(ingest_store.list_pages, job.job_id)
+    except Exception:  # noqa: BLE001 — a warning must never 500 the caller
+        logger.warning(
+            "ingest %s: page scan for warnings failed", job.job_id, exc_info=True
+        )
+        return None
+
+
 async def _create_and_enqueue(
     job_id: str, project_id: int, body: IngestRequest
 ) -> None:
@@ -475,7 +494,7 @@ async def ingest_status(
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    return ingest_flow.job_response(job)
+    return ingest_flow.job_response(job, pages=await _pages_for_warnings(job))
 
 
 @router.delete("/ingest/{job_id}", response_model=IngestJobResponse)
@@ -487,7 +506,7 @@ async def ingest_cancel(
     job = await asyncio.to_thread(ingest_store.cancel_job, job_id, int(user["id"]))
     if job is None:
         raise HTTPException(status_code=404, detail="Ingest job not found")
-    return ingest_flow.job_response(job)
+    return ingest_flow.job_response(job, pages=await _pages_for_warnings(job))
 
 
 @router.post("/ingest/{job_id}/retry-webhook", response_model=WebhookRetryResponse)

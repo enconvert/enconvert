@@ -46,7 +46,9 @@ def pptx_to_markdown(file_bytes: bytes) -> str:
     for index, slide in enumerate(prs.slides, start=1):
         title_shape = slide.shapes.title
         title_text = (
-            title_shape.text.strip() if title_shape is not None and title_shape.text else ""
+            _flatten_soft_breaks(title_shape.text).strip()
+            if title_shape is not None and title_shape.text
+            else ""
         )
         # python-pptx returns a fresh proxy object per access, so identity
         # (``is``) is unreliable — match the title by its stable shape_id.
@@ -64,7 +66,10 @@ def pptx_to_markdown(file_bytes: bytes) -> str:
             if title_id is not None and shape.shape_id == title_id:
                 continue
             if shape.has_table:
-                rows = [[cell.text for cell in row.cells] for row in shape.table.rows]
+                rows = [
+                    [_flatten_soft_breaks(cell.text) for cell in row.cells]
+                    for row in shape.table.rows
+                ]
                 table_md = rows_to_markdown_table(rows)
                 if table_md:
                     body.append(table_md)
@@ -85,11 +90,26 @@ def pptx_to_markdown(file_bytes: bytes) -> str:
     return markdown
 
 
+def _flatten_soft_breaks(text: str) -> str:
+    """Turn PowerPoint's soft line break into a space.
+
+    python-pptx renders ``<a:br/>`` — the break you get from shift+Enter, which
+    PowerPoint decks use constantly for manual line wrapping — as U+000B
+    (VERTICAL TAB). It is invisible in a terminal but a raw control character
+    in the deliverable, and it survived all the way into the JSONL ``content``
+    field. It is a break INSIDE one bullet, so it collapses to a space: a
+    newline would split the bullet into an orphan line.
+    """
+    if not text:
+        return text
+    return " ".join(text.replace("\v", " ").replace("\f", " ").split())
+
+
 def _text_frame_to_markdown(text_frame) -> str:
     """Render a text frame's paragraphs as level-indented bullet lines."""
     lines: list[str] = []
     for paragraph in text_frame.paragraphs:
-        text = paragraph.text.strip()
+        text = _flatten_soft_breaks(paragraph.text).strip()
         if not text:
             continue
         level = min(getattr(paragraph, "level", 0) or 0, 4)
@@ -98,13 +118,21 @@ def _text_frame_to_markdown(text_frame) -> str:
 
 
 def _slide_notes(slide) -> str:
+    """Speaker notes as prose. Soft breaks are real line breaks here — notes
+    are a paragraph block, not a bullet — so each becomes its own line."""
     try:
         if not slide.has_notes_slide:
             return ""
         notes = slide.notes_slide.notes_text_frame.text
     except Exception:  # noqa: BLE001 — notes are optional metadata
         return ""
-    return notes.strip() if notes else ""
+    if not notes:
+        return ""
+    lines = [
+        _flatten_soft_breaks(line)
+        for line in notes.replace("\v", "\n").replace("\f", "\n").splitlines()
+    ]
+    return "\n".join(line for line in lines if line).strip()
 
 
 def xlsx_to_markdown(file_bytes: bytes) -> str:

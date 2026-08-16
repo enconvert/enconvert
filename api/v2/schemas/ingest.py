@@ -117,6 +117,24 @@ class IngestRequest(BaseModel):
     wait_for: Optional[str] = Field(default=None, max_length=1024)
     wait_timeout_ms: int = Field(default=30000, ge=0, le=60000)
 
+    # Markdown knobs — same names, semantics and defaults as /v2/perceive,
+    # because both endpoints now produce the SAME markdown for a page.
+    only_main_content: bool = Field(
+        default=True,
+        description="When true (default), each page's markdown strips site "
+        "chrome (navigation, header, footer, sidebars, cookie banners, "
+        "hidden nodes) behind a fidelity guard that falls back to the full "
+        "page when stripping would remove too much real content. When "
+        "false, the full page is chunked as-is.",
+    )
+    truncate_data_arrays: Optional[bool] = Field(
+        default=None,
+        description="Collapse long runs of numeric literals (raw embedding "
+        "vectors, tensor dumps in notebook output cells) to a leading "
+        "sample plus a count. Unset (the default) follows "
+        "only_main_content.",
+    )
+
     chunk: ChunkOptions = Field(default_factory=ChunkOptions)
 
     webhook_url: Optional[str] = Field(default=None, max_length=2048)

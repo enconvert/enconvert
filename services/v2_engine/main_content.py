@@ -198,8 +198,17 @@ def extract_main_content(html: str) -> MainContentResult:
         for tag in base_soup.find_all(style=True):
             if tag.decomposed:
                 continue
-            if _style_hides(tag.get("style") or "") and not _contains_content_region(tag):
-                tag.decompose()
+            if not _style_hides(tag.get("style") or ""):
+                continue
+            if _contains_content_region(tag):
+                continue
+            # A streaming-SSR payload is deferred content whichever way the
+            # framework hides it. Guarding only the [hidden]-selector pass
+            # below would still lose a payload that also carries
+            # display:none — the same node, stripped one pass earlier.
+            if is_streaming_ssr_payload(tag):
+                continue
+            tag.decompose()
 
         # B1 — semantic tags. An article's own title block (link-poor
         # <header> inside <main>/<article>) is content, not chrome — see
@@ -229,6 +238,11 @@ def extract_main_content(html: str) -> MainContentResult:
                 # [hidden] selectors above would otherwise delete the
                 # inactive half of every tabbed code sample.
                 if is_deferred_disclosure(tag, deferred):
+                    continue
+                # Likewise a React streaming-SSR payload that has not been
+                # moved into place yet — hidden, but holding real article
+                # content rather than chrome.
+                if is_streaming_ssr_payload(tag):
                     continue
                 tag.decompose()
         except Exception:  # noqa: BLE001 — selector engine failure
@@ -363,6 +377,33 @@ def _inside_main_region(tag: Any) -> bool:
             return True
         return tag.find_parent(attrs={"role": "main"}) is not None
     except Exception:  # noqa: BLE001 — treat as chrome on any parse quirk
+        return False
+
+
+# React's streaming SSR (React 18+, Next.js app router, Remix) ships each
+# Suspense boundary's payload as ``<div hidden id="S:0">…</div>`` and moves
+# it into place from an inline script once the boundary resolves. Before
+# that script runs — which is ALWAYS the case for a no-JavaScript fetch, and
+# briefly true for a browser render captured mid-hydration — that container
+# is marked hidden while holding real article content. The id shape is the
+# framework's own (a letter plus a colon plus the boundary counter), so this
+# recognises the convention rather than any particular site.
+_SSR_PAYLOAD_ID_RE = re.compile(r"^[A-Za-z]:[0-9]+$")
+
+
+def is_streaming_ssr_payload(tag: Any) -> bool:
+    """True for a React streaming-SSR payload container.
+
+    Such a node is deferred CONTENT, never chrome: deleting it deletes
+    whatever the page had not finished hydrating (on platform.claude.com
+    that was the whole code sample plus 2.3 KB of prose).
+    """
+    try:
+        if tag.get("hidden") is None:
+            return False
+        tag_id = tag.get("id")
+        return bool(tag_id) and bool(_SSR_PAYLOAD_ID_RE.match(str(tag_id)))
+    except Exception:  # noqa: BLE001 — treat as ordinary on any parse quirk
         return False
 
 
@@ -522,13 +563,21 @@ def guard_baseline_html(html: str) -> str:
         for tag in soup.find_all(style=True):
             if tag.decomposed:
                 continue
-            if _style_hides(tag.get("style") or "") and not _contains_content_region(tag):
-                tag.decompose()
+            if not _style_hides(tag.get("style") or ""):
+                continue
+            if _contains_content_region(tag) or is_streaming_ssr_payload(tag):
+                continue
+            tag.decompose()
         for selector in _BASELINE_CHROME_SELECTORS:
             for tag in soup.select(selector):
                 if tag.decomposed or _protected_article_header(tag):
                     continue
                 if _contains_content_region(tag):
+                    continue
+                # The [hidden] selector would otherwise take the streaming-SSR
+                # payload out of the yardstick, and a candidate that dropped
+                # that content would then score full retention against it.
+                if is_streaming_ssr_payload(tag):
                     continue
                 tag.decompose()
         return str(soup)

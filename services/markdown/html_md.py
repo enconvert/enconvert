@@ -66,6 +66,31 @@ _LANG_CLASS_RE = re.compile(r"(?:^|\s)(?:language|lang|highlight-source|brush:)[
 _XML_PI_RE = re.compile(r"<\?[^>]*\?>")
 
 
+def _is_data_uri(value: str) -> bool:
+    """True for a ``data:`` URL, whatever the case or leading whitespace."""
+    return value.lstrip()[:5].lower() == "data:"
+
+
+# Characters that start a block construct when they lead a line, plus the
+# link/emphasis openers that change meaning mid-line.
+_MD_LEAD_RE = re.compile(r"^(\s*)([#>\-+*=]|\d+[.)])")
+_MD_INLINE_RE = re.compile(r"([\[\]`*_])")
+
+
+def _escape_markdown_text(text: str) -> str:
+    """Make document text inert as Markdown.
+
+    Used where a plain string replaces markup that used to enclose it (an
+    image's alt taking the place of its ``![...]()``). The alt comes from the
+    document, so "# Q3" or "[click](http://x)" would otherwise turn into a
+    live heading or link in the deliverable.
+    """
+    if not text:
+        return text
+    escaped = _MD_INLINE_RE.sub(r"\\\1", text)
+    return _MD_LEAD_RE.sub(r"\1\\\2", escaped)
+
+
 class _ArticleMarkdownConverter(MarkdownConverter):
     """Custom MarkdownConverter with tag-by-tag mapping tuned for web articles.
 
@@ -90,6 +115,11 @@ class _ArticleMarkdownConverter(MarkdownConverter):
         # Drop anchor-only and empty-href links; unwrap to plain text.
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             return text
+        # A data: href carries its whole payload inline, exactly like an
+        # inlined image — a "download" link to an embedded spreadsheet is
+        # megabytes of base64 that no consumer can follow. Keep the label.
+        if _is_data_uri(href):
+            return text
         if not text:
             # Autolink form when we only have a URL.
             return f"<{href}>"
@@ -102,6 +132,15 @@ class _ArticleMarkdownConverter(MarkdownConverter):
         if not src:
             return ""
         alt = (el.get("alt") or "").strip()
+        # An inlined image is a payload, not a reference: mammoth embeds every
+        # DOCX image as a base64 data URI, which turned an 11 MB document into
+        # 15 MB of markdown for 991 words of actual text — and an empty alt
+        # made it `![](data:...)`, a megabyte-long tag carrying nothing a
+        # reader or a retriever can use. Keep the alt text, drop the payload.
+        # The alt is escaped: it comes out of the document as plain text, and
+        # unescaped it would become live syntax ("# ", "- ", "[x](y)").
+        if _is_data_uri(src):
+            return _escape_markdown_text(alt)
         title = (el.get("title") or "").strip()
         title_part = f' "{title}"' if title else ""
         return f"![{alt}]({src}{title_part})"
@@ -178,6 +217,8 @@ def _preprocess_soup(
             continue
         img["src"] = urljoin(base_url, src)
 
+    _unwrap_heading_emphasis(soup)
+
     # Strip noisy attributes and any on* event handlers.
     for el in soup.find_all(True):
         for attr in list(el.attrs):
@@ -185,6 +226,41 @@ def _preprocess_soup(
                 del el[attr]
 
     return soup
+
+
+_EMPHASIS_TAGS = ("strong", "b", "em", "i")
+
+
+def _unwrap_heading_emphasis(soup: BeautifulSoup) -> None:
+    """Drop emphasis that wraps a WHOLE heading.
+
+    Word's heading styles are bold, so mammoth renders them as
+    ``<h2><strong>Executive Summary</strong></h2>`` — which converts to
+    ``## **Executive Summary**``, and the chunker then records the literal
+    ``**Executive Summary**`` as the section name in every chunk's
+    ``headings_path``. A heading is already emphatic; emphasis spanning all
+    of it carries no information and only leaks syntax into metadata.
+
+    Emphasis on PART of a heading ("Q3 **final** results") is meaningful and
+    is left alone.
+    """
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        while True:
+            # Children that actually carry text. Word leaves an empty
+            # bookmark anchor before the run — ``<h2><a id="_x"></a><strong>
+            # Executive Summary</strong></h2>`` — and counting that as a
+            # sibling would hide the fact that the emphasis IS the heading.
+            children = [
+                child
+                for child in heading.children
+                if (child.get_text() if getattr(child, "name", None) else str(child)).strip()
+            ]
+            if len(children) != 1:
+                break
+            only = children[0]
+            if getattr(only, "name", None) not in _EMPHASIS_TAGS:
+                break
+            only.unwrap()
 
 
 def _preprocess_html(html: str, base_url: str, tags: tuple = BOILERPLATE_TAGS) -> str:

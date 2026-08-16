@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections import Counter
 from typing import Any, BinaryIO, List, Optional
@@ -70,9 +71,12 @@ from services.v2_engine.chunking.semantic import (
     DEFAULT_SENTENCE_OVERLAP,
     chunk_markdown,
 )
-from services.v2_engine.crawl4ai_processors import (
-    generate_fit_markdown,
-    generate_markdown_bytes,
+from services.browser.converters.arun_flow import CONTENT_JSON
+from services.markdown.nonhtml import fenced_document
+from services.v2_engine.crawl4ai_processors import generate_markdown_bytes
+from services.v2_engine.page_markdown import (
+    full_page_markdown,
+    main_content_markdown,
 )
 from services.v2_engine.markdown_jsonl import (
     encode_jsonl,
@@ -99,6 +103,95 @@ FINAL_ENDPOINT = "v2-ingest"        # the deliverable JSONL
 
 _TERMINAL_STATUSES = ("completed", "failed", "canceled")
 
+# Recorded on a page row that resolved to content an earlier page in the same
+# job already contributed. The row stays 'completed' with chunk_count=0: it is
+# not a failure (nothing went wrong, and counting it as one would make a
+# perfectly healthy job report pages_failed > 0), it simply adds nothing.
+DUPLICATE_NOTE = "duplicate content: already ingested from an earlier page in this job"
+
+# Ceiling on a raw (text/plain, JSON) body surfaced verbatim. An HTML page is
+# bounded by extraction; a raw body is not, and it is copied through markdown,
+# chunks, JSONL records and the staged upload. 8 MB is far above the real
+# cases (an llms.txt is ~100 KB, an llms-full.txt a few MB) and far below what
+# would matter on a 1 GB droplet.
+MAX_NON_HTML_CHARS = 8 * 1024 * 1024
+
+
+_SELF_URL_PLACEHOLDER = "\x00self\x00"
+
+
+def content_fingerprint(markdown: str, *urls: Optional[str]) -> str:
+    """sha256 of a page's markdown with its OWN address neutralised.
+
+    The same document served at two addresses is byte-different only
+    because its relative links resolve against different bases — the
+    LlamaIndex docs home appeared at ``/en/stable/`` and at ``/``, whose
+    markdown differed solely in six anchor hrefs. A raw hash calls those
+    two distinct pages and ships every chunk twice.
+
+    Only the page's OWN urls are folded, so two genuinely different pages
+    can never collide: their prose differs, and every other link is left
+    exactly as it is.
+    """
+    text = markdown
+    variants: set[str] = set()
+    for url in urls:
+        if not url:
+            continue
+        variants.add(url)
+        variants.add(url.rstrip("/"))
+    # Longest first so a shorter variant cannot pre-empt a longer one. The
+    # lookahead matches the url only as a COMPLETE url (end, fragment, or a
+    # markdown/quote delimiter) — never as the prefix of a longer path, or a
+    # page served at the site root would also fold every other link on the
+    # site and two genuinely different pages could collide.
+    for variant in sorted(variants, key=len, reverse=True):
+        if not variant:
+            continue
+        text = re.sub(
+            re.escape(variant) + r"(?=[#)\s\"']|$)",
+            _SELF_URL_PLACEHOLDER,
+            text,
+        )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class PageIdentitySet:
+    """The pages a job has already contributed, by identity and by content.
+
+    Two layers, because neither alone is sufficient:
+
+    * ``final_url`` — the post-redirect address. Catches a redirect
+      collision even when the two renders are not byte-identical (rotating
+      nonces, timestamps, A/B variants). Only known after the render, so it
+      cannot move upstream into discovery.
+    * ``content_hash`` — sha256 of the page markdown. Catches identical
+      content served from genuinely different addresses (print views,
+      mirrored paths), and is the layer that survives a worker restart:
+      it is re-seeded from the completed page rows, which already persist
+      ``content_hash``, so no new column and no migration is needed.
+
+    Seeded from completed rows ONLY, so a page that failed before it could
+    contribute never suppresses a later identical page.
+    """
+
+    def __init__(self, pages: Optional[List[IngestPage]] = None) -> None:
+        self._urls: set[str] = set()
+        self._hashes: set[str] = set()
+        for page in pages or []:
+            if page.status == "completed" and page.content_hash:
+                self._hashes.add(page.content_hash)
+
+    def contains(self, final_url: Optional[str], content_hash: str) -> bool:
+        if final_url and final_url in self._urls:
+            return True
+        return content_hash in self._hashes
+
+    def add(self, final_url: Optional[str], content_hash: str) -> None:
+        if final_url:
+            self._urls.add(final_url)
+        self._hashes.add(content_hash)
+
 
 # ── Config (persisted in ch_ingest_jobs.chunk_options JSONB) ─────────────────
 
@@ -113,6 +206,16 @@ def build_job_config(request: IngestRequest) -> dict[str, Any]:
         "chunk": {
             "max_words": request.chunk.max_words,
             "sentence_overlap": request.chunk.sentence_overlap,
+        },
+        "markdown": {
+            "only_main_content": request.only_main_content,
+            # Tri-state resolved at submit so a resumed job keeps the
+            # caller's effective choice even if the default ever changes.
+            "truncate_data_arrays": (
+                request.only_main_content
+                if request.truncate_data_arrays is None
+                else request.truncate_data_arrays
+            ),
         },
         "render": {
             "wait_for": request.wait_for,
@@ -166,12 +269,66 @@ def _extract_title(html: str) -> str:
     return ""
 
 
-def _markdown_for(html: str, base_url: str) -> str:
-    """Fit-markdown (pruned main content) for chunking, with a full-markdown
-    fallback when the content filter prunes everything to nothing."""
-    fit = generate_fit_markdown(html, base_url)
-    if fit and fit.strip():
-        return fit.decode("utf-8")
+def _markdown_for(
+    html: str,
+    base_url: str,
+    *,
+    content_category: Optional[str] = None,
+    content_type: Optional[str] = None,
+    only_main_content: bool = True,
+    truncate_arrays: bool = True,
+) -> str:
+    """The page's Markdown for chunking — the SAME rendition /v2/perceive ships.
+
+    Ingest used to run Crawl4AI's Fit Markdown here, which is why the same
+    URL came out of the two endpoints looking like two different products:
+    the pruning filter deletes every ``<header>`` by tag name (so modern doc
+    sites lost their ``<h1>`` and standfirst on every page), prunes
+    link-only table cells and list labels individually (ragged tables, list
+    items starting with a bare ``:``), and has no notion of cookie banners,
+    icon-font glyphs, empty headings or numeric-array bloat. See
+    ``page_markdown`` for the measured comparison.
+
+    Non-HTML bodies never reach an HTML parser:
+
+    * ``text/plain`` is ALREADY a line-structured document — it is passed
+      through verbatim so the heading-aware chunker sees its real structure.
+      (Fencing it would make the whole file one atomic chunk, which is the
+      opposite of what a RAG pipeline wants.)
+    * ``application/json`` has no meaningful split point, so it is fenced as
+      one atomic block via the shared ``nonhtml`` helper, whose fence is
+      always longer than any backtick run in the body.
+    """
+    if content_category is not None:
+        body = html
+        if len(body) > MAX_NON_HTML_CHARS:
+            # A raw body has no structure to prune, so nothing downstream
+            # bounds it: before this path existed the newline collapse
+            # accidentally capped it by producing zero chunks. Truncate
+            # visibly rather than let one llms-full.txt drive the whole
+            # per-page pipeline (markdown -> chunks -> records -> upload)
+            # to several times its size on a small droplet.
+            body = body[:MAX_NON_HTML_CHARS]
+            body += (
+                f"\n\n[truncated: the source exceeded "
+                f"{MAX_NON_HTML_CHARS} characters]\n"
+            )
+        if content_category == CONTENT_JSON:
+            return fenced_document(body, language="json", frontmatter=False)
+        return body
+
+    warnings: List[str] = []
+    if only_main_content:
+        main = main_content_markdown(
+            html, base_url, warnings, truncate_arrays=truncate_arrays
+        )
+        if main and main.strip():
+            return main.decode("utf-8")
+    full = full_page_markdown(html, base_url, truncate_arrays=truncate_arrays)
+    if full and full.strip():
+        return full.decode("utf-8")
+    # Last resort: the raw conversion, un-prepped. Reached only when both
+    # curated paths produced nothing at all.
     return generate_markdown_bytes(html, base_url).decode("utf-8")
 
 
@@ -264,9 +421,23 @@ async def _discover_urls(
 
 
 async def _url_to_markdown(
-    page: IngestPage, render: dict[str, Any]
-) -> tuple[str, str, str]:
-    """Render a URL page to (markdown, title, source_ref)."""
+    page: IngestPage, render: dict[str, Any], markdown: dict[str, Any]
+) -> tuple[str, str, str, str]:
+    """Render a URL page to (markdown, title, source_ref, final_url).
+
+    ``allow_tls=False`` is deliberate. The engine ladder's TLS rung is a
+    plain HTTP fetch with no JavaScript, and the render-quality scorer
+    cannot tell a complete server-rendered page from a shell that has not
+    hydrated — so it scored those bodies 1.00 and never escalated. On the
+    ETL corpus that meant ingest captured pre-hydration HTML on every
+    JS-rendered documentation site: React Suspense payloads still parked
+    in ``<div hidden id="S:0">``, skeleton loaders whose screen-reader
+    label ("Loading") leaked into the chunks, un-dismissed cookie banners,
+    and (measured on docs.pinecone.io) less than half the page's text.
+    Ingest builds a durable retrieval corpus, so it pays for the real
+    browser render — the same trade /v2/watch already makes to keep its
+    baselines comparable.
+    """
     from services.v2_engine import perceive_flow
 
     rendered = await perceive_flow.render_html(
@@ -274,10 +445,28 @@ async def _url_to_markdown(
         respect_robots=bool(render.get("respect_robots", False)),
         wait_for=render.get("wait_for"),
         wait_timeout_ms=int(render.get("wait_timeout_ms", 30000)),
+        allow_tls=False,
     )
     html = rendered.html or ""
     final_url = rendered.final_url or page.url
-    return _markdown_for(html, final_url), _extract_title(html), page.url
+    # Both are CPU-bound bs4/markdown passes over a page that can be
+    # megabytes: offload them so the shared event loop keeps serving.
+    text = await asyncio.to_thread(
+        _markdown_for,
+        html,
+        final_url,
+        content_category=rendered.content_category,
+        content_type=rendered.content_type,
+        only_main_content=bool(markdown.get("only_main_content", True)),
+        truncate_arrays=bool(markdown.get("truncate_data_arrays", True)),
+    )
+    title = await asyncio.to_thread(_extract_title, html)
+    # source_ref stays the REQUESTED url (that is the provenance the caller
+    # asked for and what metadata.source_url has always carried); final_url
+    # is returned alongside it because the post-redirect address is the
+    # page's real identity — two discovered URLs that redirect to the same
+    # place are one page (see _process_one_page's duplicate handling).
+    return text, title, page.url, final_url
 
 
 async def _file_to_markdown(page: IngestPage) -> tuple[str, str, str]:
@@ -300,6 +489,16 @@ async def _file_to_markdown(page: IngestPage) -> tuple[str, str, str]:
     return markdown, label, label
 
 
+class EmptyPageError(Exception):
+    """A page yielded no extractable text (blocked, a JS shell, a 404 body).
+
+    Distinguished from a crash so the caller records an honest SKIP instead
+    of counting an empty page as a successful one — a job whose only page was
+    empty used to report ``completed`` with ``total_chunks: 0`` and ship an
+    empty JSONL.
+    """
+
+
 async def _process_one_page(
     job: IngestJob,
     page: IngestPage,
@@ -307,19 +506,52 @@ async def _process_one_page(
     max_words: int,
     sentence_overlap: int,
     render: dict[str, Any],
-) -> int:
+    markdown_cfg: Optional[dict[str, Any]] = None,
+    seen: Optional["PageIdentitySet"] = None,
+) -> tuple[int, bool]:
     """(URL render | file convert) -> markdown -> chunk -> stage JSONL -> complete.
 
-    Returns the chunk count for this page. Raises on a fetch/convert/upload
-    failure so the caller records a failed page; one bad page never sinks the job.
+    Returns ``(chunk_count, is_duplicate)``. Raises ``EmptyPageError`` when
+    the page produced no text at all, and re-raises fetch/convert/upload
+    failures so the caller records a failed page; one bad page never sinks
+    the job.
+
+    Duplicate handling: discovery works on URL strings, so it cannot know
+    that two structurally different URLs redirect to the same resource
+    (``docs.llamaindex.ai/en/stable/`` and ``docs.llamaindex.ai/`` both land
+    on ``developers.llamaindex.ai/python/framework/``, which shipped every
+    chunk twice). That fact only exists after the render, so the check lives
+    here: a page whose post-redirect URL or whose markdown content hash was
+    already produced by an earlier page in this job is completed with zero
+    chunks rather than duplicated into the deliverable.
     """
+    seen = PageIdentitySet() if seen is None else seen
+    final_url: Optional[str] = None
     if page.source_type == "file":
         markdown, title, source_ref = await _file_to_markdown(page)
     else:
-        markdown, title, source_ref = await _url_to_markdown(page, render)
+        markdown, title, source_ref, final_url = await _url_to_markdown(
+            page, render, markdown_cfg or {}
+        )
 
-    chunks = chunk_markdown(
-        markdown, max_words=max_words, sentence_overlap=sentence_overlap
+    if not markdown.strip():
+        raise EmptyPageError("the page returned no extractable content")
+
+    content_hash = content_fingerprint(markdown, final_url, page.url)
+    is_duplicate = seen.contains(final_url, content_hash)
+
+    # Offloaded like every other CPU-bound step here: the ingest worker runs
+    # on the same event loop that serves HTTP, so parsing a multi-megabyte
+    # page inline would stall every other request on the droplet.
+    chunks = (
+        []
+        if is_duplicate
+        else await asyncio.to_thread(
+            chunk_markdown,
+            markdown,
+            max_words=max_words,
+            sentence_overlap=sentence_overlap,
+        )
     )
     # id_seed is the page's unique identity (URL, or the uploaded file's object
     # key); source_ref is only the display label and is NOT unique for files.
@@ -336,7 +568,6 @@ async def _process_one_page(
         _page_filename(job.job_id, page.url),
     )
 
-    content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
     word_count = sum(chunk.word_count for chunk in chunks)
     await asyncio.to_thread(
         ingest_store.complete_page,
@@ -344,8 +575,11 @@ async def _process_one_page(
         chunk_count=len(chunks),
         word_count=word_count,
         content_hash=content_hash,
+        note=DUPLICATE_NOTE if is_duplicate else None,
     )
-    return len(chunks)
+    if not is_duplicate:
+        seen.add(final_url, content_hash)
+    return len(chunks), is_duplicate
 
 
 # ── Worker entry point ───────────────────────────────────────────────────────
@@ -384,6 +618,10 @@ async def process_job(job_id: str) -> None:
     chunk_cfg = config.get("chunk", {})
     render_cfg = config.get("render", {})
     discovery_cfg = config.get("discovery", {})
+    # Jobs submitted before the markdown options existed have no "markdown"
+    # block; the defaults inside _markdown_for match what they used to get
+    # once the pipeline itself was fixed, so a resumed old job is consistent.
+    markdown_cfg = config.get("markdown", {})
     max_words = int(chunk_cfg.get("max_words", DEFAULT_MAX_WORDS))
     sentence_overlap = int(chunk_cfg.get("sentence_overlap", DEFAULT_SENTENCE_OVERLAP))
 
@@ -451,6 +689,9 @@ async def process_job(job_id: str) -> None:
     failed = len([p for p in pages if p.status in ("failed", "skipped")])
     chunks_total = sum(p.chunk_count for p in done_pages)
     quota_denied: Optional[str] = None  # 402 detail once the quota trips
+    # Re-seeded from the DB, so a resumed job still recognises the pages the
+    # interrupted attempt already contributed (see PageIdentitySet).
+    seen = PageIdentitySet(pages)
 
     async def _sync_progress() -> None:
         # EVERY page outcome (processed, failed, skipped) must reach the job
@@ -504,26 +745,42 @@ async def process_job(job_id: str) -> None:
 
         await asyncio.to_thread(ingest_store.mark_page_processing, page.id)
         try:
-            chunk_count = await _process_one_page(
+            chunk_count, is_duplicate = await _process_one_page(
                 job,
                 page,
                 max_words=max_words,
                 sentence_overlap=sentence_overlap,
                 render=render_cfg,
+                markdown_cfg=markdown_cfg,
+                seen=seen,
             )
-            # job_id + hashed page URL (or object key for file pages) is
-            # unique per page, so a worker crash-and-resume that re-processes
-            # a page bills it exactly once at the ledger.
-            page_digest = hashlib.md5(page.url.encode("utf-8")).hexdigest()[:16]
-            await asyncio.to_thread(
-                usage.increment_ingest_usage,
-                job.project_id,
-                idempotency_key=f"v2:op:ingest:{job_id}:{page_digest}",
-            )
+            if not is_duplicate:
+                # job_id + hashed page URL (or object key for file pages) is
+                # unique per page, so a worker crash-and-resume that
+                # re-processes a page bills it exactly once at the ledger.
+                # A duplicate contributed nothing, so it is not billed — and
+                # because its row is left 'completed', a resume never
+                # re-enters it and can never bill it later either.
+                page_digest = hashlib.md5(page.url.encode("utf-8")).hexdigest()[:16]
+                await asyncio.to_thread(
+                    usage.increment_ingest_usage,
+                    job.project_id,
+                    idempotency_key=f"v2:op:ingest:{job_id}:{page_digest}",
+                )
             processed += 1
             chunks_total += chunk_count
         except asyncio.CancelledError:
             raise  # shutdown: leave the row 'processing'; resumed next boot
+        except EmptyPageError as exc:
+            # Not a crash and not a success: the render/convert worked but
+            # there was nothing to chunk. Recorded as a skip so the job's
+            # counters stay honest instead of reporting a completed page
+            # that contributed an empty file.
+            logger.info(
+                "ingest %s: no extractable content for %s", job_id, _safe(page.url)
+            )
+            await asyncio.to_thread(ingest_store.skip_page, page.id, str(exc))
+            failed += 1
         except Exception as exc:  # noqa: BLE001 — isolate per-page failures
             logger.exception("ingest %s: page failed for %s", job_id, _safe(page.url))
             await asyncio.to_thread(ingest_store.fail_page, page.id, str(exc))
@@ -861,14 +1118,65 @@ def _truncation_warning(job: IngestJob) -> Optional[str]:
     return None
 
 
+def wants_duplicate_scan(job: IngestJob) -> bool:
+    """True when ``job_response`` could produce a duplicate warning for this
+    job, so a caller knows whether loading its page rows is worth a query.
+
+    Only terminal jobs can have duplicates, and clients stop polling once a
+    job is terminal — so the extra read happens roughly once per job, not
+    once per poll.
+    """
+    return job.status in ("completed", "failed")
+
+
+def _duplicate_warning(job: IngestJob, pages: List[IngestPage]) -> Optional[str]:
+    """Note how many pages resolved to already-ingested content, or None.
+
+    Silence here would be misleading in the other direction: pages_processed
+    counts a duplicate (nothing failed), so without this the caller sees
+    "10 pages processed" and a deliverable built from fewer.
+
+    Pure: the caller supplies the rows. ``job_response`` runs inline in async
+    request handlers, and every DB read in this module is deliberately
+    offloaded with ``asyncio.to_thread`` — a synchronous query here would
+    block the event loop the ingest worker shares with the HTTP server.
+    """
+    if not wants_duplicate_scan(job):
+        return None
+    duplicates = sum(
+        1
+        for page in pages
+        if page.status == "completed" and page.error_message == DUPLICATE_NOTE
+    )
+    if not duplicates:
+        return None
+    return (
+        f"{duplicates} of {len(pages)} page(s) resolved to content already "
+        "ingested from another page in this job (usually a redirect to the "
+        "same destination) and were excluded from the output."
+    )
+
+
 def job_response(
-    job: IngestJob, *, warnings: Optional[List[str]] = None
+    job: IngestJob,
+    *,
+    warnings: Optional[List[str]] = None,
+    pages: Optional[List[IngestPage]] = None,
 ) -> IngestJobResponse:
-    """Build the API view of a job, signing the output URL when present."""
+    """Build the API view of a job, signing the output URL when present.
+
+    ``pages`` are the job's page rows when the caller has already loaded
+    them (off-thread); without them the duplicate note is simply omitted
+    rather than fetched synchronously from an async handler.
+    """
     combined = list(warnings or [])
     note = _truncation_warning(job)
     if note is not None:
         combined.append(note)
+    if pages is not None:
+        duplicate_note = _duplicate_warning(job, pages)
+        if duplicate_note is not None:
+            combined.append(duplicate_note)
     return IngestJobResponse(
         job_id=job.job_id,
         status=job.status,  # type: ignore[arg-type]

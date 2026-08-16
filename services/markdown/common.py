@@ -27,6 +27,32 @@ _TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 
 _BLANKS_RE = re.compile(r"\n{3,}")
 
+# C0 control characters other than tab and newline. Office formats carry them
+# as in-band markup — PowerPoint's soft line break is U+000B, Word's field
+# separators are U+0001/U+0014 — and they reach the deliverable as raw control
+# bytes that no consumer can render. Each extractor makes the semantic call for
+# the ones it knows about (see office_md); this is the backstop for the rest,
+# and it maps to a SPACE so a stray control can never split a line and change
+# the document's markdown structure.
+#
+# C1 (U+0080-U+009F) is deliberately NOT included. Those code points appear in
+# real text almost exclusively as mis-decoded Windows-1252 punctuation, and
+# ``decode_text_bytes`` maps them back to the characters they stand for —
+# scrubbing them here would delete every smart quote and em dash in a document
+# that had to fall back to latin-1.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+# Windows-1252's printable characters in the C1 byte range. latin-1 decodes
+# those bytes to control code points instead, so a Windows-authored file that
+# trips the latin-1 fallback loses its punctuation to mojibake.
+_CP1252_C1 = {
+    code: char
+    for code, char in zip(
+        range(0x80, 0xA0),
+        "€\x81‚ƒ„…†‡ˆ‰Š‹Œ\x8dŽ\x8f\x90‘’“”•–—˜™š›œ\x9džŸ",
+    )
+}
+
 # ── Untrusted-upload safety limits ───────────────────────────────────────────
 # ZIP decompression-bomb guard: bound the declared uncompressed total and the
 # entry count. The upload gate only bounds COMPRESSED bytes; DEFLATE reaches
@@ -42,12 +68,22 @@ MAX_TABLE_ROWS = 5_000
 
 
 def decode_text_bytes(data: bytes) -> str:
-    """Best-effort decode of text bytes to str (never raises)."""
+    """Best-effort decode of text bytes to str (never raises).
+
+    latin-1 is the last resort because it accepts any byte — but it maps
+    0x80-0x9F to C1 control code points, and in real files those bytes are
+    Windows-1252 punctuation (a document with one byte cp1252 does not define
+    falls all the way through to latin-1 and loses every smart quote and em
+    dash to mojibake). Translate that range back to what it stands for.
+    """
     for encoding in _TEXT_ENCODINGS:
         try:
-            return data.decode(encoding)
+            text = data.decode(encoding)
         except UnicodeDecodeError:
             continue
+        if encoding == "latin-1":
+            text = text.translate(_CP1252_C1)
+        return text
     return data.decode("utf-8", errors="replace")
 
 
@@ -116,6 +152,8 @@ def rows_to_markdown_table(rows: Iterable[Sequence[object]]) -> str:
 def _clean_cell(cell: object) -> str:
     """One-line, pipe-escaped, length-capped cell text."""
     text = ("" if cell is None else str(cell)).replace("\r", " ").replace("\n", " ")
+    # A control character inside a cell would survive into the rendered row.
+    text = _CONTROL_RE.sub(" ", text)
     text = text.replace("|", "\\|").strip()
     if len(text) > MAX_TABLE_CELL_CHARS:
         text = text[:MAX_TABLE_CELL_CHARS] + "…"
@@ -123,8 +161,10 @@ def _clean_cell(cell: object) -> str:
 
 
 def normalize_markdown(text: str) -> str:
-    """Normalize line endings and collapse 3+ blank lines to one; trailing \\n."""
+    """Normalize line endings, strip stray control characters, collapse 3+
+    blank lines to one; trailing \\n."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _CONTROL_RE.sub(" ", text)
     text = _BLANKS_RE.sub("\n\n", text)
     return text.strip() + "\n"
 

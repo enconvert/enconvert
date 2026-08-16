@@ -507,7 +507,12 @@ def complete_page(
     chunk_count: int,
     word_count: int,
     content_hash: Optional[str],
+    note: Optional[str] = None,
 ) -> None:
+    """Mark a page done. ``note`` records WHY a completed page contributed
+    nothing (today: it duplicated an earlier page). It reuses error_message
+    as the row's free-text field — the status stays 'completed', so nothing
+    that classifies by status reads it as a failure."""
     db = get_db()
     try:
         page = db.exec(
@@ -519,6 +524,7 @@ def complete_page(
         page.chunk_count = chunk_count
         page.word_count = word_count
         page.content_hash = content_hash
+        page.error_message = note[:2000] if note else None
         page.processed_at = _utcnow()
         db.add(page)
         db.commit()

@@ -82,6 +82,7 @@ from services.v2_engine.main_content import (
     _style_hides,
     controlled_ids,
     is_deferred_disclosure,
+    is_streaming_ssr_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -267,6 +268,10 @@ _BLOCK_TAGS: tuple[str, ...] = (
 _BLOCK_IN_LINK: tuple[str, ...] = _HEADING_TAGS + _BLOCK_TAGS
 
 _BLOCK_NAMES: frozenset[str] = frozenset(_BLOCK_TAGS + _HEADING_TAGS)
+# Cells flatten their whole subtree onto one markdown line, so block
+# structure inside them stops separating anything (see
+# _insert_sibling_separators).
+_TABLE_CELL_NAMES: tuple[str, ...] = ("td", "th")
 
 # Tags whose text must never be reflowed or separated.
 _VERBATIM_TAGS: tuple[str, ...] = ("pre", "code", "script", "style", "textarea")
@@ -561,6 +566,8 @@ def _drop_hidden_nodes(soup: BeautifulSoup) -> None:
             continue
         if _contains_content_region(tag):
             continue
+        if is_streaming_ssr_payload(tag):
+            continue
         if is_deferred_disclosure(tag, controlled):
             continue
         tag.decompose()
@@ -721,21 +728,29 @@ def _insert_sibling_separators(soup: BeautifulSoup) -> None:
     spans (Linear's text-scramble headings) are exactly that shape, and
     gluing them would turn one word into a column of letters.
 
-    Only INLINE pairs are considered. Block siblings already convert to
-    separate markdown blocks, so gluing them buys nothing — and skipping
-    them keeps this pass off the page-sized subtrees near the root.
+    Only INLINE pairs are considered — EXCEPT inside a table cell. Block
+    siblings normally convert to separate markdown blocks, so gluing them
+    buys nothing, but a pipe table flattens a cell onto one line: an
+    invoice or newsletter laid out as a table (``<td><p>Invoice 4471</p>
+    <p>Issued 12 March</p></td>``) came out as ``Invoice 4471Issued 12
+    March``, with the word boundary destroyed.
     """
     for parent in soup.find_all(True):
         if parent.name in _VERBATIM_TAGS:
             continue
         if parent.find_parent(_VERBATIM_TAGS) is not None:
             continue
+        in_table_cell = parent.name in _TABLE_CELL_NAMES or (
+            parent.find_parent(_TABLE_CELL_NAMES) is not None
+        )
         children = list(parent.children)
         for index in range(len(children) - 1):
             current, following = children[index], children[index + 1]
             if not isinstance(current, Tag) or not isinstance(following, Tag):
                 continue
-            if current.name in _BLOCK_NAMES or following.name in _BLOCK_NAMES:
+            if not in_table_cell and (
+                current.name in _BLOCK_NAMES or following.name in _BLOCK_NAMES
+            ):
                 continue
             left, right = _edge_text(current), _edge_text(following)
             if len(left) < 2 or len(right) < 2:

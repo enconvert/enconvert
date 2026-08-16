@@ -61,6 +61,30 @@ _BIDI_CONTROLS = frozenset(
 _LINE_SEPARATORS = frozenset("  ")
 
 
+def sanitize_content(text: str) -> str:
+    """Neutralize the one thing a chunk body can do to the FILE itself.
+
+    ``json.dumps(ensure_ascii=False)`` does not escape U+2028 / U+2029 —
+    they are not JSON control characters — so they are emitted raw inside
+    the content string. Python's ``str.splitlines()`` (and every other
+    Unicode-aware line splitter, including this module's own
+    ``decode_jsonl``) treats them as line breaks, which splits one record
+    into two invalid fragments and loses the chunk.
+
+    The label sanitizer has always dropped them; content did not, because
+    content used to arrive only from an HTML->Markdown pass that could not
+    emit one. A verbatim ``text/plain`` body can. They are line separators,
+    so they become a newline rather than being deleted — no character of
+    the customer's document is silently dropped.
+    """
+    if not text:
+        return text
+    for separator in _LINE_SEPARATORS:
+        if separator in text:
+            text = text.replace(separator, "\n")
+    return text
+
+
 def sanitize_metadata_label(value: str, *, max_length: int) -> str:
     """Normalize an attacker-influenceable string for JSONL metadata.
 
@@ -141,7 +165,7 @@ def build_record(
     seed = id_seed if id_seed is not None else safe_source
     return {
         "id": f"{_page_slug(seed)}-{index:04d}",
-        CONTENT_KEY: chunk.text,
+        CONTENT_KEY: sanitize_content(chunk.text),
         "metadata": {
             "source_url": safe_source,
             "title": safe_title,

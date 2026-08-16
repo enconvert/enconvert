@@ -57,6 +57,30 @@ _PUA_RE = re.compile(
 )
 
 
+# --- C5: font/layout metric probes -----------------------------------------
+
+# Web-font loaders and layout libraries measure text by injecting a filler
+# node and reading its box back. The node is usually removed again — but a
+# DOM captured mid-measurement still has it, and it converts to a line of one
+# token repeated dozens of times ("word word word ...", observed on Mintlify
+# docs). No prose repeats a single token this many times with nothing else on
+# the line, so the shape identifies the probe without knowing the library.
+#
+# The bound is set well above anything a human would write (a chant, a
+# redacted field, a status row) and well below the real filler, which runs to
+# hundreds of repeats. Only a marker-less paragraph line can match at all —
+# a heading, list item, blockquote or table row carries a marker token, so
+# its tokens are never all identical.
+_PROBE_MIN_REPEATS: int = 30
+
+
+def _is_metric_probe_line(line: str) -> bool:
+    tokens = line.split()
+    if len(tokens) < _PROBE_MIN_REPEATS:
+        return False
+    return len(set(tokens)) == 1
+
+
 # --- C2: repeated blocks ---------------------------------------------------
 
 # Longest repeated block collapsed. Twelve lines covers a logo strip
@@ -117,7 +141,11 @@ def truncate_data_arrays(markdown: str) -> str:
 
 
 def _strip_structural_residue(lines: list[str]) -> list[str]:
-    """C1 — drop empty headings/links and collapse rule runs."""
+    """C1 — drop empty headings/links and collapse rule runs.
+
+    Also drops C5 font/layout metric-probe lines. Fenced code is exempt from
+    every rule here: a code sample may legitimately repeat a token.
+    """
     cleaned: list[str] = []
     in_fence = False
     for line in lines:
@@ -131,6 +159,8 @@ def _strip_structural_residue(lines: list[str]) -> list[str]:
             continue
 
         if _EMPTY_HEADING_RE.match(line):
+            continue
+        if _is_metric_probe_line(line):
             continue
         if _EMPTY_LINK_RE.search(line):
             line = _EMPTY_LINK_RE.sub("", line)
@@ -166,13 +196,33 @@ def _fence_mask(lines: list[str]) -> list[bool]:
     return mask
 
 
+def _minimal_period(block: list[str]) -> list[str]:
+    """One line, when ``block`` is the same line repeated; ``block`` otherwise.
+
+    The scan below takes the LONGEST repeating block, which is right for a
+    genuine multi-line duplicate but wrong when every line is identical: a
+    run of seven identical lines matches as "three lines, twice" and emits
+    three copies instead of one (a font-metric probe injected once per
+    measured face did exactly that).
+
+    Deliberately limited to an all-identical block rather than any periodic
+    one. A block like ``[row1, row2, row1, row2]`` IS periodic, but reducing
+    it would collapse a genuinely repeated multi-row group — the case this
+    module already says it must not touch — so it is left exactly as the
+    pre-existing scan emitted it.
+    """
+    if len(block) > 1 and len(set(block)) == 1:
+        return block[:1]
+    return block
+
+
 def _collapse_repeated_blocks(lines: list[str]) -> list[str]:
     """C2 — keep one copy of an immediately repeated block.
 
     Scans for the longest block that repeats starting at the current
-    position and emits it once. Code fences are never collapsed (two
-    identical examples side by side are legitimate), and neither are
-    table rows, where duplicate data lines can be real.
+    position and emits its minimal period once. Code fences are never
+    collapsed (two identical examples side by side are legitimate), and
+    neither are table rows, where duplicate data lines can be real.
     """
     mask = _fence_mask(lines)
     total = len(lines)
@@ -200,7 +250,7 @@ def _collapse_repeated_blocks(lines: list[str]) -> list[str]:
                 cursor += size
             if repeats < 2:
                 continue
-            output.extend(block)
+            output.extend(_minimal_period(block))
             index = cursor
             collapsed = True
             break

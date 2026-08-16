@@ -69,6 +69,36 @@ async def convert_to_markdown(file_bytes: bytes, filename: str) -> bytes:
     return normalize_markdown(markdown).encode("utf-8", errors="replace")
 
 
+def _uploaded_html_to_markdown(html: str) -> str:
+    """An uploaded web page gets the SAME treatment as a crawled one.
+
+    A saved page carries the site's navigation, cookie banner and footer, and
+    converting it faithfully put all of that in the chunks — while crawling
+    the identical URL produced clean article markdown. Same input, two
+    different answers, depending only on how it arrived. This routes an
+    uploaded page through the shared page-markdown ensemble, which has a
+    fidelity guard: if stripping would take too much, it returns the whole
+    page rather than a stub.
+
+    Imported lazily — the ensemble reaches back into this package for the
+    shared HTML core, so a module-level import would be circular. It also
+    keeps the browser/V2 dependency off the import path of every other
+    format.
+    """
+    from services.v2_engine.page_markdown import main_content_markdown
+
+    warnings: list[str] = []
+    # images_to_alt=False: /v2/perceive can drop an image URL because it
+    # offers the full image list as a separate output. A file upload has no
+    # second channel, so the reference has to survive in the markdown.
+    curated = main_content_markdown(
+        html, "", warnings, images_to_alt=False
+    ).decode("utf-8", errors="replace")
+    if curated.strip():
+        return curated
+    return html_to_markdown(html, "", extract_article=False)
+
+
 async def _dispatch(ext: str, file_bytes: bytes, filename: str) -> str:
     if ext in _TEXT_EXTS:
         # Plain text / Markdown: decode off the event loop (a large upload with a
@@ -77,9 +107,7 @@ async def _dispatch(ext: str, file_bytes: bytes, filename: str) -> str:
 
     if ext in _HTML_EXTS:
         html = decode_text_bytes(file_bytes)
-        return await asyncio.to_thread(
-            html_to_markdown, html, "", extract_article=False
-        )
+        return await asyncio.to_thread(_uploaded_html_to_markdown, html)
 
     if ext == ".pdf":
         from .pdf_md import pdf_to_markdown
