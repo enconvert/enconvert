@@ -10,14 +10,14 @@ from api.deps import check_abuse_patterns, check_rate_limits, check_ops_quota, c
 
 from monitoring.metrics import log_activity_start, log_batch_activity_start, update_activity_status
 from monitoring import posthog_client
-from utils.storage import upload_to_gcs
+from utils.storage import sanitize_filename, upload_to_gcs
 from utils.processor import handle_url_conversion, process_batch_async, validate_auth_cookies_headers, discover_website_urls
 from services.v2_engine.url_safety import assert_public_http_url
 from services.page_quality.instrumentation import header_opts_out
 from utils.conversion_jobs import get_conversion_job
 from utils.batch_status import get_batch_status
 from utils.storage import generate_presigned_url
-from utils.validators import ALLOWED_EXTENSIONS, validate_file_format, validate_file_content, validate_svg_dimensions
+from utils.validators import ALLOWED_EXTENSIONS, validate_file_format, validate_file_content, validate_svg_dimensions, normalize_upload_filename
 from utils.sitemap import fetch_sitemap_urls
 from utils.subscription import get_project_owner_email
 from utils.email_notifier import send_job_completion_email
@@ -265,6 +265,18 @@ async def forward_to_backend(
     check_ops_quota(user)
     check_storage_limit(user)
 
+    # Repair the filename BEFORE either gate. Both gates -- and the converters
+    # themselves -- re-derive the input type from this string, but it is
+    # client-controlled metadata that our own clients routinely send without a
+    # usable extension ("blob", "file", "IMG_0042", ""). Valid PNG bytes named
+    # "blob" used to reach png_to_svg and die on its `!= ".png"` check, which
+    # surfaced the raw internal "Expected a PNG file (.png)" as a 400 and logged
+    # a Failed activity row. Normalizing here fixes every upload path at once --
+    # web, widget, playground, CLI, n8n, SDKs -- because it is the one choke
+    # point they all funnel through. No-op for names that already declare a
+    # known binary type, so a genuinely wrong format still gets its clean 400.
+    original_filename = normalize_upload_filename(original_filename, file_content or b"")
+
     # Extension gate (declared type) followed by a conservative content
     # (magic-byte) gate. Both rejections surface as upload_rejected_bad_format
     # with a distinguishing reason.
@@ -274,6 +286,27 @@ async def forward_to_backend(
     except HTTPException:
         _capture_upload_rejected(user, request, endpoint, provided_ext, "extension_not_allowed")
         raise
+    # Re-run the pdf_options geometry gate against the NORMALIZED name. The
+    # routes run it first so the common case is rejected as early as possible,
+    # but they only ever see the RAW filename -- and both gates deliberately
+    # stay silent on an unknown extension so the format error wins. An
+    # extension-less upload therefore slipped past them, and the option would
+    # then either be silently discarded by LibreOffice or rejected only inside
+    # the converter, after an activity row already existed. Running it here --
+    # after normalization, still before log_activity_start -- restores the
+    # routes' guarantee for repaired names without touching all ten call sites.
+    if pdf_options:
+        resolved_ext = os.path.splitext(original_filename or "")[1].lower()
+        try:
+            if endpoint == "anything-to-pdf":
+                assert_options_supported(original_filename, pdf_options)
+            elif resolved_ext in ALLOWED_EXTENSIONS.get(endpoint, ()):
+                # The nine LibreOffice-backed endpoints: geometry comes from the
+                # source document's own page style, so it cannot be honored.
+                assert_geometry_supported(pdf_options, fmt=resolved_ext, engine="LibreOffice")
+        except UnsupportedOptionError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     content_mismatch = validate_file_content(endpoint, original_filename, file_content or b"")
     if content_mismatch:
         _capture_upload_rejected(
@@ -484,7 +517,7 @@ async def forward_to_backend(
                     "X-Object-Key": upload_result["object_key"],
                     "X-File-Size": str(upload_result["file_size"]),
                     "X-Conversion-Time": str(duration),
-                    "X-Filename": filename,
+                    "X-Filename": upload_result["filename"],
                 }
             )
 
@@ -513,11 +546,11 @@ async def forward_to_backend(
                 content=output_bytes,
                 media_type=response_media_type,
                 headers={
-                    "Content-Disposition": f'inline; filename="{filename}"',
+                    "Content-Disposition": f'inline; filename="{upload_result["filename"]}"',
                     "X-Object-Key": upload_result["object_key"],
                     "X-File-Size": str(upload_result["file_size"]),
                     "X-Conversion-Time": str(duration),
-                    "X-Filename": filename,
+                    "X-Filename": upload_result["filename"],
                 }
             )
 
@@ -1463,7 +1496,7 @@ async def download_file(
 
     content_type = s3_obj.get("ContentType", "application/octet-stream")
     content_length = s3_obj.get("ContentLength")
-    filename = Path(object_key).name
+    filename = sanitize_filename(Path(object_key).name)  # legacy keys may hold non-ASCII
 
     posthog_client.capture(
         posthog_client.distinct_id_for_project(user["id"]),

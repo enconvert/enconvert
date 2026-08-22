@@ -4,6 +4,7 @@ DigitalOcean Spaces utility for uploading converted files.
 import logging
 import os
 import re
+import unicodedata
 import boto3
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
@@ -83,7 +84,11 @@ def sanitize_filename(filename: str) -> str:
     """Sanitize filename to prevent path traversal and remove unsafe characters."""
     filename = os.path.basename(filename)
     filename = filename.replace("..", "")
-    filename = re.sub(r'[<>:"|?*]', '', filename)
+    # ponytail: ASCII-only. Header values are latin-1 (Starlette raises on
+    # anything else) and this name lands in X-Filename / Content-Disposition.
+    # Upgrade path if non-Latin names matter: RFC 5987 filename*=UTF-8''...
+    filename = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode()
+    filename = re.sub(r'[<>:"|?*\x00-\x1f\x7f]', '', filename)
     filename = filename.replace(" ", "_")
 
     if not filename or filename == ".":

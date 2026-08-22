@@ -37,7 +37,10 @@ def webp_to_jpeg(file_bytes: bytes, original_filename:str) ->bytes:
     # lazy import: keep the heavy native lib off idle RAM (B3)
     from PIL import Image
     ext = os.path.splitext(original_filename or "")[1].lower()
-    if ext not in (".webp"):
+    # (".webp") is a STRING, not a 1-tuple, so `not in` was doing substring
+    # matching -- ".we", ".b", ".p" and "." all passed this gate. The trailing
+    # comma makes it the tuple it was always meant to be.
+    if ext not in (".webp",):
         raise ValueError("Expected a WEBP file (.webp)")
     
     temp_file_path = write_temp_file(file_bytes, ext)

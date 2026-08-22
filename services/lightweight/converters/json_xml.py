@@ -4,6 +4,8 @@ from io import BytesIO, TextIOWrapper
 
 import xmltodict
 
+from services.lightweight.converters.csv_xml import xml_safe
+
 def json_to_xml(json_bytes: bytes) -> bytes:
     """
     Convert JSON to XML.
@@ -19,8 +21,8 @@ def json_to_xml(json_bytes: bytes) -> bytes:
     """
     try:
         json_str = json_bytes.decode('utf-8')
-        data = json.loads(json_str)
-        
+        data = xml_safe(json.loads(json_str))
+
         if isinstance(data, list):
             wrapped_data = {'root': {'item': data}}
         elif isinstance(data, dict):

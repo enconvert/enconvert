@@ -1,6 +1,26 @@
 import csv
+import re
 import xmltodict
 from io import BytesIO, StringIO, TextIOWrapper
+
+
+def _xml_name(key) -> str:
+    """Coerce a user-supplied key into a legal XML element name."""
+    name = re.sub(r'[^\w.-]', '_', str(key if key is not None else '').strip()) or 'field'
+    return name if re.match(r'[^\W\d]', name) else f'_{name}'
+
+
+def xml_safe(obj):
+    """Rewrite every dict key in a nested structure via _xml_name.
+
+    ponytail: colliding keys ('a b' and 'a_b') merge, last one wins -- same
+    as a duplicate CSV header already does in DictReader today.
+    """
+    if isinstance(obj, dict):
+        return {_xml_name(k): xml_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [xml_safe(v) for v in obj]
+    return obj
 
 
 def csv_to_xml(csv_bytes: bytes) -> bytes:
@@ -25,7 +45,7 @@ def csv_to_xml(csv_bytes: bytes) -> bytes:
         if not data:
             raise ValueError("CSV file is empty or has no valid rows")
 
-        wrapped_data = {'root': {'item': data}}
+        wrapped_data = {'root': {'item': xml_safe(data)}}
         # unparse writes straight into UTF-8 bytes via the wrapper: the str +
         # .encode() path held two full copies of the output at peak.
         buf = BytesIO()

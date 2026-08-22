@@ -28,7 +28,7 @@ xmltodict==1.0.2
 pyyaml==6.0.3
 pandas==2.3.3
 markdown==3.10
-weasyprint==65.0
+weasyprint==65.1
 crawlee[parsel,playwright]==1.0.*
 toml==0.10.2
 Pillow==11.2.1

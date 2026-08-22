@@ -25,7 +25,10 @@ ALLOWED_EXTENSIONS = {
     "markdown-to-pdf": [".md", ".markdown"],
     "anything-to-markdown": list(_MARKDOWN_EXTENSIONS),
     "anything-to-pdf": list(_PDF_EXTENSIONS),
-    "image": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".svg", ".ico"],
+    # NOTE: no "image" key -- POST /v1/convert/image is commented out in
+    # api/v1/convert.py, so an entry here would gate nothing. Restore it in the
+    # same commit that uncomments the route (test_no_allowed_extension_key_is_dead
+    # enforces this).
     "thumbnail": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".svg", ".mp4", ".avi", ".mov", ".mkv", ".webm"],
     "video": [".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"],
     "ocr": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".pdf"],
@@ -43,11 +46,36 @@ ALLOWED_EXTENSIONS = {
     "xml-to-csv": [".xml"],
     "jpeg-to-png": [".jpeg", ".jpg"],
     "png-to-jpeg": [".png"],
-    "jpg-to-svg": [".jpeg", ".jpg"],
+    # NOTE: the endpoint is "jpeg-to-svg" (CONVERTER_MAP + the route in
+    # api/v1/convert.py). The old "jpg-to-svg" key here matched no endpoint, so
+    # it gated nothing while the real endpoint fell through the fail-open branch
+    # in validate_file_format.
+    "jpeg-to-svg": [".jpeg", ".jpg"],
     "svg-to-jpeg": [".svg"],
     "svg-to-png": [".svg"],
     "svg-to-webp": [".svg"],
     "compress-image": [".png", ".jpg", ".jpeg", ".webp"],
+    # Every remaining image endpoint in CONVERTER_MAP. These were absent, and
+    # validate_file_format fails OPEN on a missing key, so nothing rejected a
+    # wrong extension before dispatch -- the converter's own bare string gate
+    # (e.g. png_to_svg's "Expected a PNG file (.png)") became the only check and
+    # surfaced as a raw internal message. tests/v2/test_converter_gate_parity.py
+    # now fails the build if this dict and CONVERTER_MAP ever drift again.
+    "png-to-svg": [".png"],
+    "png-to-webp": [".png"],
+    "png-to-heic": [".png"],
+    "webp-to-png": [".webp"],
+    "webp-to-jpeg": [".webp"],
+    "webp-to-svg": [".webp"],
+    "webp-to-heic": [".webp"],
+    "heic-to-png": [".heic", ".heif"],
+    "heic-to-jpeg": [".heic", ".heif"],
+    "heic-to-svg": [".heic", ".heif"],
+    "heic-to-webp": [".heic", ".heif"],
+    "jpeg-to-webp": [".jpeg", ".jpg"],
+    "jpeg-to-heic": [".jpeg", ".jpg"],
+    "svg-to-heic": [".svg"],
+    "pdf-to-jpeg": [".pdf"],
 }
 
 # ---------------------------------------------------------------------------
@@ -288,6 +316,181 @@ def validate_file_content(endpoint: str, filename: str, content: bytes) -> str |
     return (
         f"declared '{ext}' ({expected}) but the file content is '{detected}'"
     )
+
+
+# Canonical extension to attach when the bytes identify a type but the supplied
+# filename does not. The "office" group is absent here on purpose: one ZIP
+# signature covers .docx/.xlsx/.odt/.epub/..., so it is resolved separately by
+# _zip_container_ext, which reads the container's own self-description.
+_GROUP_TO_EXT: dict[str, str] = {
+    "png": ".png",
+    "jpeg": ".jpg",
+    "gif": ".gif",
+    "webp": ".webp",
+    "heic": ".heic",
+    "pdf": ".pdf",
+}
+
+# OOXML declares its type in [Content_Types].xml; ODF and EPUB declare theirs in
+# a "mimetype" entry. Both are cheap to read and unambiguous, so an office
+# upload named "blob" or "file" (the n8n / FormData defaults) can be resolved
+# exactly rather than rejected.
+_OOXML_CONTENT_TYPE_TO_EXT = (
+    ("wordprocessingml.document", ".docx"),
+    ("spreadsheetml.sheet", ".xlsx"),
+    ("presentationml.presentation", ".pptx"),
+)
+_MIMETYPE_TO_EXT = {
+    "application/vnd.oasis.opendocument.text": ".odt",
+    "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+    "application/vnd.oasis.opendocument.presentation": ".odp",
+    "application/vnd.oasis.opendocument.spreadsheet-template": ".ots",
+    "application/epub+zip": ".epub",
+}
+# Cap on what we will read out of an untrusted archive member. The manifests we
+# care about are a few KB; anything larger is not one of them, and refusing to
+# inflate past this bounds a zip bomb to a harmless read.
+_ZIP_MANIFEST_MAX_BYTES = 256 * 1024
+
+
+def _zip_container_ext(content: bytes) -> str | None:
+    """Resolve a ZIP-container office/e-book format to its exact extension.
+
+    Returns None for a plain ZIP (or anything unreadable) so the caller falls
+    back to leaving the filename alone. Never raises: a malformed or hostile
+    archive must not turn a conversion into a 500.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+
+            # ODF/EPUB: a "mimetype" member holding the media type verbatim.
+            if "mimetype" in names:
+                info = archive.getinfo("mimetype")
+                if info.file_size <= _ZIP_MANIFEST_MAX_BYTES:
+                    declared = archive.read("mimetype").decode("ascii", "ignore").strip()
+                    if declared in _MIMETYPE_TO_EXT:
+                        return _MIMETYPE_TO_EXT[declared]
+
+            # OOXML: [Content_Types].xml names the part's own content type.
+            if "[Content_Types].xml" in names:
+                info = archive.getinfo("[Content_Types].xml")
+                if info.file_size <= _ZIP_MANIFEST_MAX_BYTES:
+                    manifest = archive.read("[Content_Types].xml").decode("utf-8", "ignore")
+                    for marker, ext in _OOXML_CONTENT_TYPE_TO_EXT:
+                        if marker in manifest:
+                            return ext
+    except Exception:  # noqa: BLE001 - detection must never raise
+        return None
+    return None
+
+
+def _looks_like_svg(content: bytes) -> bool:
+    """True when the bytes parse as XML whose ROOT element is <svg>.
+
+    Checking the root (rather than searching for the substring "<svg") is what
+    keeps HTML out: an HTML page embedding an inline SVG has root <html>. Reuses
+    the same bounded slice as svg_intrinsic_size, which also caps how much
+    hostile XML expat is ever handed.
+    """
+    try:
+        iterator = ET.iterparse(io.BytesIO(content[:_SVG_SNIFF_BYTES]), events=("start",))
+        _, root = next(iterator)
+    except Exception:  # noqa: BLE001 - not XML, truncated, or hostile -> not an SVG
+        return False
+    # Strip the namespace: "{http://www.w3.org/2000/svg}svg" -> "svg".
+    return root.tag.rsplit("}", 1)[-1].lower() == "svg"
+
+
+# Every extension the product recognizes as a declared input type, derived from
+# the endpoint tables so it can never drift from them. A name carrying one of
+# these already states what it is -- including text types with no magic bytes
+# (.svg/.txt/.csv/.json/...) -- so the normalizer leaves it alone and lets the
+# gates judge it. Only names carrying NO recognized type get repaired.
+def _declared_input_extensions() -> frozenset[str]:
+    known = set(_EXT_EXPECTED)
+    for extensions in ALLOWED_EXTENSIONS.values():
+        known.update(extensions)
+    return frozenset(known)
+
+
+_DECLARED_INPUT_EXTS = _declared_input_extensions()
+
+
+def _detect_upload_extension(content: bytes) -> str | None:
+    """The canonical extension the CONTENT warrants, or None when undecidable.
+
+    Layered cheapest-first: binary magic, then the ZIP container's own manifest,
+    then a bounded XML root-element check for SVG.
+    """
+    group = _detect_binary_type(content)
+    if group == "office":
+        return _zip_container_ext(content)
+    if group is not None:
+        return _GROUP_TO_EXT.get(group)
+    if _looks_like_svg(content):
+        return ".svg"
+    return None
+
+
+def normalize_upload_filename(filename: str | None, content: bytes) -> str:
+    """Repair an upload filename whose extension is missing or non-indicative.
+
+    The converters and ``validate_file_format`` both re-derive the INPUT TYPE
+    from the filename string, but a filename is client-controlled metadata that
+    routinely arrives without a usable extension through our own clients:
+
+      - ``FormData.append('file', blob)`` with no third argument -> "blob"
+      - the n8n node's ``binaryData.fileName ?? 'file'`` fallback -> "file"
+      - ``enconvert convert shot.dat --from png`` -> "shot.dat"
+      - mobile photo pickers and renamed/extension-less downloads -> "IMG_0042"
+      - a multipart part sent with ``filename=""`` -> ""
+
+    In every one of those cases the BYTES are a perfectly valid PNG/JPEG/WebP/
+    HEIC/GIF/PDF/SVG/DOCX/..., so rejecting them was our bug, not bad input.
+    This runs before both gates and re-attaches the extension the content
+    actually warrants.
+
+    Conservative by construction -- the name is returned untouched unless BOTH:
+      - it declares no extension the product recognizes as an input type (a
+        declared type is left alone so ``validate_file_format`` /
+        ``validate_file_content`` can judge it and a genuinely wrong format
+        still earns its clean "Invalid file format" 400), and
+      - the content resolves to exactly one extension (see
+        ``_detect_upload_extension``).
+
+    Formats with no dependable signature and no recognized extension
+    (json/csv/txt/md/yaml/toml named "blob") are never rewritten: nothing
+    identifies them, so the name is left as sent.
+    """
+    name = (filename or "").strip()
+
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _DECLARED_INPUT_EXTS:
+        # Already states its type -- ".png", but also text types like ".svg" and
+        # ".csv" that carry no magic bytes. Leave it: validate_file_format
+        # decides whether that type belongs on this endpoint, and
+        # validate_file_content decides whether the bytes back the claim.
+        return name
+
+    canonical = _detect_upload_extension(content)
+    if canonical is None:
+        # Unrecognized content (or a signature-less text format) -> fail open
+        # and leave the caller's name exactly as sent.
+        return name
+
+    # Names that carry no usable base. os.path.splitext ignores leading dots, so
+    # ".png" splits to (".png", "") and "." to (".", "") -- appending to either
+    # yields a name whose extension splitext STILL cannot read ("..png"), which
+    # is the very failure this function exists to prevent. Anything that is only
+    # dots, or is itself just an extension, gets a real base name instead.
+    base = name
+    if not base.strip(".") or base.lower() in _DECLARED_INPUT_EXTS:
+        base = "upload"
+    return base + canonical
+
 
 def is_safe_filename(filename: str) -> bool:
     """Validate filename to prevent path traversal and injection attacks"""

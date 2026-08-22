@@ -943,7 +943,7 @@ async def handle_url_conversion(
                     "X-Object-Key": result["object_key"],
                     "X-File-Size": str(result["file_size"]),
                     "X-Conversion-Time": str(duration),
-                    "X-Filename": filename,
+                    "X-Filename": result["filename"],
                 }
             )
         # Private keys with explicit direct_download=True: stream bytes directly
@@ -951,13 +951,13 @@ async def handle_url_conversion(
             content=output_bytes,
             media_type=media_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": f'attachment; filename="{result["filename"]}"',
                 "Content-Length": str(len(output_bytes)),
                 "Cache-Control": "no-transform",
                 "X-Object-Key": result["object_key"],
                 "X-File-Size": str(result["file_size"]),
                 "X-Conversion-Time": str(duration),
-                "X-Filename": filename,
+                "X-Filename": result["filename"],
             }
         )
 
