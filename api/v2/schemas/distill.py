@@ -36,7 +36,14 @@ from __future__ import annotations
 import re
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from api.v2.schemas.discover import DiscoverMode
 
@@ -76,6 +83,40 @@ _TRANSFORMS = frozenset({"lowercase", "uppercase", "strip"})
 # that itself contains '*'/'+'/'{', so ordinary patterns like ``(abc)+``
 # or ``\d+`` pass.
 _REDOS_RE = re.compile(r"\([^()]*[*+{][^()]*\)\s*[*+{]")
+
+# Second ReDoS family the nested-quantifier rule above misses entirely:
+# a re-quantified ALTERNATION whose branches can match the same single
+# character — ``(a|a)+``, ``(\w|\w)+``, ``([a-z]|[a-z])*``, ``(?:a|a)+``.
+# These double their work per input character exactly like ``(a+)+``.
+# Multi-character branches (``(cat|dog)+``) do not overlap that way and
+# stay allowed. Both rules are heuristics: they bound the shapes that are
+# known to explode, not every regex that can.
+_ALT_GROUP_RE = re.compile(r"\((?:\?:)?([^()]*\|[^()]*)\)\s*[*+{]")
+_SINGLE_TOKEN_RE = re.compile(r"^(?:\\.|\[[^\]]*\]|[^\\])$")
+
+# Keys that describe the schema itself rather than naming an output
+# field. The edge validator and distill_flow.schema_properties MUST agree
+# on this set: when they disagreed, a flat-map field named 'required'
+# passed validation and then vanished from the output.
+RESERVED_SCHEMA_KEYS = frozenset({"type", "properties", "required"})
+
+
+def _alternation_is_explosive(pattern: str) -> bool:
+    """True when a quantified group alternates between single tokens."""
+    for branches in _ALT_GROUP_RE.findall(pattern):
+        parts = re.split(r"(?<!\\)\|", branches)
+        singles = [p for p in parts if _SINGLE_TOKEN_RE.match(p)]
+        if len(parts) >= 2 and len(singles) >= 2:
+            return True
+    return False
+
+
+def schema_property_names(schema: dict[str, Any]) -> list[str]:
+    """The output field names a caller schema declares, in either form."""
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and properties:
+        return [str(name) for name in properties]
+    return [str(name) for name in schema if name not in RESERVED_SCHEMA_KEYS]
 
 
 def _css_schema_depth(fields: object, depth: int) -> int:
@@ -135,6 +176,12 @@ class CssField(BaseModel):
                     "regex pattern rejected: nested quantifiers risk "
                     "catastrophic backtracking (ReDoS)"
                 )
+            if _alternation_is_explosive(value):
+                raise ValueError(
+                    "regex pattern rejected: a re-quantified alternation of "
+                    "single-character branches risks catastrophic "
+                    "backtracking (ReDoS)"
+                )
         return value
 
     @field_validator("transform")
@@ -151,8 +198,19 @@ class CssField(BaseModel):
     def _type_requirements(self) -> "CssField":
         if self.type == "attribute" and not self.attribute:
             raise ValueError("field type 'attribute' requires 'attribute'")
-        if self.type == "regex" and not self.pattern:
-            raise ValueError("field type 'regex' requires 'pattern'")
+        if self.type == "regex":
+            if not self.pattern:
+                raise ValueError("field type 'regex' requires 'pattern'")
+            # Crawl4AI reads match.group(1), so a groupless pattern matches
+            # and yields nothing on every record. That looked identical to
+            # "the selector found no data" and pushed the field into the
+            # paid LLM pass, with no way for the caller to see why.
+            if re.compile(self.pattern).groups < 1:
+                raise ValueError(
+                    "field type 'regex' requires a capture group: the "
+                    "extracted value is group 1 of the match, so a pattern "
+                    "without '(...)' can never return anything"
+                )
         if self.type in ("nested", "list", "nested_list"):
             if not self.fields:
                 raise ValueError(
@@ -362,13 +420,22 @@ class DistillRequest(BaseModel):
                     f"(max {MAX_SCHEMA_PROPERTIES})"
                 )
             return schema
-        # Flat {field: description} map form — every key names a field.
-        if any(key in schema for key in ("type", "items", "$ref")):
+        # Flat {field: description} map form — every key names a field,
+        # except the schema-level keys the pipeline strips. Those are the
+        # ONLY reserved names: a business field called 'items' or '$ref'
+        # used to be a hard 422 even though nothing downstream minded it.
+        field_names = [
+            name for name in schema if name not in RESERVED_SCHEMA_KEYS
+        ]
+        if not field_names:
+            # e.g. {"required": ["a", "b"]}: structurally valid JSON, no
+            # extractable field in it. This used to render every URL,
+            # consume an op each and return an empty data object.
             raise ValueError(
-                "schema must declare 'properties' or be a flat "
-                "{field: description} map"
+                "schema declares no fields; use a flat {field: description} "
+                "map or a JSON-Schema object with a non-empty 'properties'"
             )
-        if len(schema) > MAX_SCHEMA_PROPERTIES:
+        if len(field_names) > MAX_SCHEMA_PROPERTIES:
             raise ValueError(
                 f"schema declares too many fields (max {MAX_SCHEMA_PROPERTIES})"
             )
@@ -381,6 +448,28 @@ class DistillRequest(BaseModel):
         if has_urls == has_discover:
             raise ValueError(
                 "provide exactly one of 'urls' or 'discover_from'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _target_field_is_a_schema_property(self) -> "DistillRequest":
+        """A target_field that names nothing is a 422, not a silent bill.
+
+        A typo'd target_field ('prodcts' for 'products') matched every CSS
+        record, discarded all of them, reported ``fields_from_css: 0`` and
+        re-extracted the identical data through the paid LLM pass with an
+        empty warnings list. Nothing in the response revealed it.
+        """
+        if self.extraction_schema is None or self.css_schema is None:
+            return self
+        target = self.css_schema.target_field
+        if target is None:
+            return self
+        names = schema_property_names(self.extraction_schema)
+        if target not in names:
+            raise ValueError(
+                f"css_schema.target_field '{target}' is not a property of "
+                f"'schema' (declared properties: {', '.join(sorted(names))})"
             )
         return self
 
@@ -412,6 +501,22 @@ class DistillItemResult(BaseModel):
     cost_cents: float = 0.0
     error: Optional[str] = None
     warnings: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _always_emit_data(self, handler: Any) -> dict[str, Any]:
+        """Keep ``data`` in the payload even when it is null.
+
+        The route serializes with ``exclude_none``, which stripped the
+        key entirely from a failed row. The documented contract is
+        ``data: null`` on failure, and a typed client doing
+        ``result.data.heading`` crashed on the missing key instead of
+        reading a null. ``url_final`` and ``error`` stay conditional —
+        those the docs do describe as omitted.
+        """
+        dumped = handler(self)
+        if "data" not in dumped:
+            dumped["data"] = None
+        return dumped
 
 
 class DistillResponse(BaseModel):

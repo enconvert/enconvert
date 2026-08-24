@@ -263,6 +263,25 @@ async def health_check():
     )
 
 
+# Request fields whose VALUE must never be echoed back in an error body.
+# These are exactly where callers put credentials — a session cookie or a
+# bearer header quoted in a 422 lands in the client's logs and in the
+# gateway access log, turning a typo into a credential disclosure.
+_SENSITIVE_FIELDS = frozenset({
+    "cookie", "cookies", "header", "headers", "authorization", "auth",
+    "api_key", "apikey", "token", "access_token", "refresh_token",
+    "password", "secret", "credential", "credentials", "session",
+})
+
+
+def _is_sensitive_loc(loc: tuple) -> bool:
+    """True when any segment of a field path names a credential carrier."""
+    return any(
+        isinstance(part, str) and part.lower() in _SENSITIVE_FIELDS
+        for part in loc
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     """Human-readable 422s (2026-08-06 QA report, fix A1 companion).
@@ -305,7 +324,11 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
             message = f"{path}: required parameter is missing."
         else:
             message = f"{path}: {msg}."
-            if sent is not None and not isinstance(sent, (dict, list)):
+            if (
+                sent is not None
+                and not isinstance(sent, (dict, list))
+                and not _is_sensitive_loc(loc)
+            ):
                 sent_repr = repr(sent)
                 if len(sent_repr) <= 120:
                     message = f"{path}: {msg} (you sent {sent_repr})."

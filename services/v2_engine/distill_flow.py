@@ -50,6 +50,7 @@ from fastapi import HTTPException
 from api.deps import check_ops_quota
 from api.v2.schemas.discover import DiscoverRequest
 from api.v2.schemas.distill import (
+    RESERVED_SCHEMA_KEYS,
     DistillItemResult,
     DistillRequest,
     DistillResponse,
@@ -114,11 +115,17 @@ def schema_properties(schema: dict[str, Any]) -> dict[str, Any]:
     """
     properties = schema.get("properties")
     if isinstance(properties, dict) and properties:
-        return dict(properties)
+        # A bare string under 'properties' is the flat form's description
+        # leaking into the JSON-Schema form; normalize it here so the rest
+        # of the pipeline only ever sees property objects.
+        return {
+            str(name): schema_llm.coerce_property(prop)
+            for name, prop in properties.items()
+        }
     return {
         str(name): {"type": ["string", "null"], "description": str(desc)}
         for name, desc in schema.items()
-        if name not in ("type", "properties", "required")
+        if name not in RESERVED_SCHEMA_KEYS
     }
 
 
@@ -131,24 +138,41 @@ def _is_array_prop(prop: Any) -> bool:
     return declared == "array"
 
 
+def _is_object_prop(prop: Any) -> bool:
+    if not isinstance(prop, dict):
+        return False
+    declared = prop.get("type")
+    if isinstance(declared, list):
+        return "object" in declared
+    return declared == "object" or "properties" in prop
+
+
 def apply_css_records(
     props: dict[str, Any],
     records: list[dict[str, Any]],
     target_field: Optional[str],
-) -> tuple[dict[str, Any], int]:
-    """Map CSS records onto the output schema; return (data, fields_filled).
+) -> tuple[dict[str, Any], int, list[str]]:
+    """Map CSS records onto the schema; return (data, fields_filled, warnings).
 
     * ``target_field`` set, array property -> the full record list.
-    * ``target_field`` set, scalar/object property -> the first record.
+    * ``target_field`` set, object property -> the first record whole.
+    * ``target_field`` set, scalar property -> the VALUE inside the first
+      record, not the record itself.
     * ``target_field`` omitted, schema has exactly one array property ->
       that property receives the list (the e-commerce ``{products: [...]}``
       case).
     * otherwise -> the first record is treated as a single flat object and
       its declared keys are lifted to the top level.
+
+    Every path that cannot place the records says so in ``warnings``.
+    Discarding them silently made the free pass look like it found nothing
+    and pushed the same fields into the paid LLM pass, which is the one
+    failure mode a caller has no way to detect from the response.
     """
     data: dict[str, Any] = {}
+    warnings: list[str] = []
     if not records:
-        return data, 0
+        return data, 0, warnings
 
     field_name = target_field
     if field_name is None:
@@ -157,11 +181,17 @@ def apply_css_records(
             field_name = array_props[0]
 
     if field_name is not None and field_name in props:
-        if _is_array_prop(props[field_name]):
+        prop = props[field_name]
+        if _is_array_prop(prop):
             data[field_name] = records
-            return data, 1
-        data[field_name] = records[0]
-        return data, 1
+            return data, 1, warnings
+        value, unwrap_warning = _scalar_from_record(
+            prop, field_name, records[0]
+        )
+        data[field_name] = value
+        if unwrap_warning:
+            warnings.append(unwrap_warning)
+        return data, 1, warnings
 
     first = records[0]
     filled = 0
@@ -169,7 +199,40 @@ def apply_css_records(
         if name in first and first[name] not in _EMPTY:
             data[name] = first[name]
             filled += 1
-    return data, filled
+    if not filled:
+        warnings.append(
+            f"the CSS pass matched {len(records)} record(s), but none of "
+            f"their keys ({', '.join(sorted(str(k) for k in first))}) name a "
+            f"schema property ({', '.join(sorted(props))}); the records were "
+            "discarded. Set 'css_schema.target_field' to the property they "
+            "should fill — otherwise these fields fall through to the paid "
+            "LLM pass."
+        )
+    return data, filled, warnings
+
+
+def _scalar_from_record(
+    prop: Any, field_name: str, record: Any
+) -> tuple[Any, Optional[str]]:
+    """The value a non-array property should take from one CSS record.
+
+    A scalar target used to receive the whole record dict, so a schema
+    saying ``{"price": {"type": "number"}}`` came back as
+    ``{"price": {"price": "51.77"}}`` — an object sitting in a number
+    field, with no warning, against a documented shape guarantee.
+    """
+    if not isinstance(record, dict) or _is_object_prop(prop):
+        return record, None
+    if field_name in record:
+        return record[field_name], None
+    if len(record) == 1:
+        return next(iter(record.values())), None
+    return record, (
+        f"'{field_name}' is a scalar property but the CSS record carries "
+        f"{len(record)} fields ({', '.join(sorted(str(k) for k in record))}); "
+        f"name one of them '{field_name}' or declare the property as an "
+        "object to control what it receives."
+    )
 
 
 def _array_items_incomplete(prop: dict[str, Any], value: Any) -> bool:
@@ -228,6 +291,29 @@ def reduced_schema(
     }
 
 
+# JSON/JS keywords a model sometimes emits as TEXT for an absent value.
+# Only literals that are never a natural English answer are coerced —
+# "none" and "n/a" stay untouched because they are real page content.
+_NULL_LITERALS = frozenset({"null", "undefined"})
+
+
+def _json_null(value: Any) -> Any:
+    """Turn a stringified null back into a real null, recursively.
+
+    The documented guarantee is "missing scalars become null". A model
+    answering with the STRING "null" broke it silently: a typed client
+    reading ``data["stock"]`` got truthy text where the contract promised
+    ``None``.
+    """
+    if isinstance(value, str):
+        return None if value.strip().lower() in _NULL_LITERALS else value
+    if isinstance(value, list):
+        return [_json_null(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_null(item) for key, item in value.items()}
+    return value
+
+
 def merge_llm_data(
     data: dict[str, Any],
     llm_data: dict[str, Any],
@@ -241,7 +327,7 @@ def merge_llm_data(
     filled = 0
     for name in fields:
         if name in llm_data:
-            value = llm_data[name]
+            value = _json_null(llm_data[name])
             data[name] = value
             if value not in _EMPTY:
                 filled += 1
@@ -340,7 +426,10 @@ async def _distill_one_url(
                 "CSS extraction timed out; fell back to the LLM pass."
             )
             records = []
-        data, fields_from_css = apply_css_records(props, records, target_field)
+        data, fields_from_css, css_warnings = apply_css_records(
+            props, records, target_field
+        )
+        item_warnings.extend(css_warnings)
 
     # Pass 2 — LLM (only the fields CSS missed, capped).
     missing = missing_fields(props, data)
@@ -375,11 +464,9 @@ async def _distill_one_url(
             )
             if result.data is not None:
                 data, fields_from_llm = merge_llm_data(data, result.data, missing)
-            if result.skipped_reason is not None:
-                item_warnings.append(
-                    f"LLM extraction skipped ({result.skipped_reason}); "
-                    "missing fields returned as null."
-                )
+            item_warnings.extend(
+                _llm_result_warnings(result, missing, fields_from_llm)
+            )
 
     data = normalize_to_schema(props, data)
     return DistillItemResult(
@@ -395,6 +482,48 @@ async def _distill_one_url(
         cost_cents=float(cost_cents),
         warnings=item_warnings,
     )
+
+
+def _llm_result_warnings(
+    result: "schema_llm.ExtractionResult",
+    missing: list[str],
+    fields_from_llm: int,
+) -> list[str]:
+    """Everything the caller needs to explain a null the LLM pass left.
+
+    Silence here is what made the expensive failures indistinguishable
+    from "the data genuinely is not on the page": a truncated completion,
+    a truncated page and a model that simply found nothing all produced
+    the same empty fields and, in two of the three cases, a real bill.
+    """
+    warnings: list[str] = []
+    if result.output_truncated:
+        warnings.append(
+            "the model hit its output limit before finishing this answer, "
+            "so the extraction was discarded and you were still billed for "
+            "the call. Ask for fewer fields, or split a large list across "
+            "several requests."
+        )
+    if result.html_truncated:
+        warnings.append(
+            "the page was larger than the extraction token budget and was "
+            "truncated, so a field reported as null may simply not have "
+            "been shown to the model. Narrow the page (a deep-link or a "
+            "'css_schema') to cover the whole document."
+        )
+    if result.skipped_reason is not None:
+        # A truncated output is not a skip — the call ran and was billed.
+        if result.skipped_reason != schema_llm.SKIP_OUTPUT_TRUNCATED:
+            warnings.append(
+                f"LLM extraction skipped ({result.skipped_reason}); "
+                "missing fields returned as null."
+            )
+    elif fields_from_llm == 0 and missing:
+        warnings.append(
+            "the LLM pass ran and was billed but found no value for: "
+            f"{', '.join(missing)}."
+        )
+    return warnings
 
 
 def _llm_skip_reason(
