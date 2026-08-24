@@ -1,7 +1,7 @@
 import os
 import base64
 
-from ._limits import svg_render_cap_kwargs, write_temp_file
+from ._limits import describe_image_error, svg_render_cap_kwargs, write_temp_file
 
 
 def jpeg_to_svg(file_bytes: bytes, original_filename: str) -> bytes:
@@ -37,7 +37,10 @@ def jpeg_to_svg(file_bytes: bytes, original_filename: str) -> bytes:
             ).encode("ascii"),
         ))
     except Exception as e:
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path, output_file_path)
+        )
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -94,7 +97,10 @@ def svg_to_jpeg(
         with open(output_file_path, "rb") as f:
             return f.read()
     except Exception as e:
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path, output_file_path)
+        )
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)

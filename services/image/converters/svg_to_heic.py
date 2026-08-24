@@ -1,6 +1,6 @@
 import os
 
-from ._limits import ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
+from ._limits import describe_image_error, ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
 
 
 def svg_to_heic(file_bytes: bytes, original_filename: str) -> bytes:
@@ -40,7 +40,10 @@ def svg_to_heic(file_bytes: bytes, original_filename: str) -> bytes:
         with open(output_file_path, "rb") as f:
             return f.read()
     except Exception as e:
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path, output_file_path)
+        )
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -94,7 +97,10 @@ def heic_to_svg(file_bytes: bytes, original_filename: str) -> bytes:
             ).encode("ascii"),
         ))
     except Exception as e:
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path, output_file_path)
+        )
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)

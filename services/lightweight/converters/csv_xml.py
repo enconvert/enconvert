@@ -56,6 +56,11 @@ def csv_to_xml(csv_bytes: bytes) -> bytes:
         return buf.getvalue()
     except UnicodeDecodeError:
         raise ValueError("Invalid CSV encoding (expected UTF-8)")
+    except ValueError:
+        # Our own diagnostic above is already the final message; letting
+        # it reach the generic handler doubled the text ("CSV to XML
+        # conversion failed: CSV file is empty or has no valid rows").
+        raise
     except Exception as e:
         raise ValueError(f"CSV to XML conversion failed: {str(e)}")
 
@@ -95,15 +100,28 @@ def xml_to_csv(xml_bytes: bytes) -> bytes:
         if not data or not isinstance(data[0], dict):
             raise ValueError("XML must contain elements with consistent fields for CSV conversion")
 
-        headers = list(data[0].keys())
+        headers: list[str] = []
+        seen: set[str] = set()
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            for key in row:
+                if key not in seen:
+                    seen.add(key)
+                    headers.append(str(key))
 
         output = StringIO()
-        csv_writer = csv.DictWriter(output, fieldnames=headers)
+        csv_writer = csv.DictWriter(output, fieldnames=headers, restval='')
         csv_writer.writeheader()
         csv_writer.writerows(data)
 
         return output.getvalue().encode('utf-8')
     except UnicodeDecodeError:
         raise ValueError("Invalid XML encoding (expected UTF-8)")
+    except ValueError:
+        # Our own diagnostic above is already the final message; letting
+        # it reach the generic handler doubled the text ("CSV to XML
+        # conversion failed: CSV file is empty or has no valid rows").
+        raise
     except Exception as e:
         raise ValueError(f"XML to CSV conversion failed: {str(e)}")

@@ -121,6 +121,37 @@ def format_exception_detail(
     return truncate_error("\n\n".join(parts), max_chars=max_chars) or summary
 
 
+def _client_error_status(exc: BaseException) -> int | None:
+    """The 4xx status of an HTTPException-like exception, else ``None``.
+
+    Duck-typed on ``status_code`` so this module keeps no FastAPI import.
+    """
+    try:
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            return status
+    except Exception:  # noqa: BLE001 — never raise from the error path
+        pass
+    return None
+
+
+def _client_error_message(exc: BaseException, status: int) -> str:
+    """One line describing a rejected request, with no stack trace.
+
+    A 4xx is the caller's input being refused exactly as designed — an
+    SSRF screen on a private address, an exhausted quota, an endpoint
+    missing from a key's allowlist. Recording a full server traceback for
+    it filled the admin Activity table with expected client errors that
+    read like crashes, burying the real ones.
+    """
+    try:
+        detail = getattr(exc, "detail", None)
+        text = " ".join(str(detail).split()) if detail else ""
+    except Exception:  # noqa: BLE001
+        text = ""
+    return f"HTTP {status}: {text}" if text else f"HTTP {status}"
+
+
 def error_fields(
     exc: BaseException | None,
     *,
@@ -140,6 +171,15 @@ def error_fields(
     """
     try:
         if exc is not None:
+            client_status = _client_error_status(exc)
+            if client_status is not None:
+                message = _client_error_message(exc, client_status)
+                if context:
+                    message = f"{message}\n\n{' '.join(str(context).split())}"
+                return {
+                    "error_message": truncate_error(message) or message,
+                    "error_type": exception_type_name(exc),
+                }
             return {
                 "error_message": format_exception_detail(exc, context=context),
                 "error_type": exception_type_name(exc),

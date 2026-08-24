@@ -1,6 +1,6 @@
 import os
 
-from ._limits import ensure_pixel_limit, write_temp_file
+from ._limits import describe_image_error, ensure_pixel_limit, write_temp_file
 
 
 def convert_image(file_bytes: bytes, ext: str, output_format: str) -> bytes:
@@ -36,7 +36,10 @@ def convert_image(file_bytes: bytes, ext: str, output_format: str) -> bytes:
         with open(output_file_path, "rb") as f:
             return f.read()
     except Exception as e:
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path, output_file_path)
+        )
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)

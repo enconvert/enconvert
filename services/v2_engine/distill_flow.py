@@ -197,7 +197,13 @@ def apply_css_records(
     filled = 0
     for name in props:
         if name in first and first[name] not in _EMPTY:
-            data[name] = first[name]
+            value = first[name]
+            # Never lift a scalar into an array-typed property: a CSS field
+            # named after an array property (with a `default`, say) put an
+            # int where a list belongs and 500'd the whole batch downstream.
+            if _is_array_prop(props[name]) and not isinstance(value, list):
+                value = [value]
+            data[name] = value
             filled += 1
     if not filled:
         warnings.append(
@@ -251,6 +257,14 @@ def _array_items_incomplete(prop: dict[str, Any], value: Any) -> bool:
     )
     if not isinstance(sub_props, dict) or not sub_props:
         return False
+    if not isinstance(value, (list, tuple)):
+        # PRODUCTION 500: a scalar reaching an array-typed property (a CSS
+        # field named after an array property with a numeric `default`)
+        # was iterated here and raised TypeError: 'int' object is not
+        # iterable. missing_fields() runs OUTSIDE the per-URL guard, so
+        # that sank the WHOLE batch — including URLs already rendered,
+        # billed and persisted. A non-list here is simply "not filled".
+        return True
     for item in value:
         if not isinstance(item, dict):
             return True
@@ -344,10 +358,16 @@ def normalize_to_schema(
     schema regardless of what CSS/LLM produced."""
     normalized: dict[str, Any] = {}
     for name, prop in props.items():
-        if name in data:
-            normalized[name] = data[name]
-        else:
+        if name not in data:
             normalized[name] = [] if _is_array_prop(prop) else None
+            continue
+        value = data[name]
+        # An array property must hold an array whatever the passes produced,
+        # or the guarantee is not a guarantee. A stray scalar is wrapped
+        # rather than dropped: the caller asked for that value.
+        if _is_array_prop(prop) and not isinstance(value, list):
+            value = [] if value in _EMPTY else [value]
+        normalized[name] = value
     return normalized
 
 
@@ -365,6 +385,27 @@ def _tier(fields_from_css: int, fields_from_llm: int) -> _TierName:
 
 
 async def _distill_one_url(
+    url: str, request: DistillRequest, **kwargs: Any
+) -> DistillItemResult:
+    """Two-pass distill of one URL; never raises (failures become a row).
+
+    The guarantee is enforced HERE, not merely promised in a docstring.
+    Only the render was guarded before, so anything raised by the work
+    that follows it (CSS mapping, the missing-field scan, merge,
+    normalize) escaped into the handler and 500'd the ENTIRE batch —
+    discarding URLs that had already rendered, billed and persisted. One
+    bad URL costs one row.
+    """
+    try:
+        return await _distill_one_url_inner(url, request, **kwargs)
+    except Exception:  # noqa: BLE001 — one bad URL must not sink the request
+        logger.exception("distill failed unexpectedly for %s", _safe(url))
+        return DistillItemResult(
+            url=url, status="failed", error="distillation failed"
+        )
+
+
+async def _distill_one_url_inner(
     url: str,
     request: DistillRequest,
     *,
@@ -377,7 +418,7 @@ async def _distill_one_url(
     llm_budget: _LlmBudget,
     usage_key: Optional[str] = None,
 ) -> DistillItemResult:
-    """Two-pass distill of one URL; never raises (failures become a row)."""
+    """The two-pass body; wrapped by _distill_one_url, which cannot raise."""
     item_warnings: list[str] = []
 
     try:

@@ -68,7 +68,10 @@ def pdf_to_jpeg(file_bytes: bytes, original_filename: str) -> bytes:
     try:
         pdf = pdfium.PdfDocument(file_bytes)
     except Exception as e:  # malformed / encrypted / not a PDF
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path)
+        )
 
     try:
         page_count = len(pdf)
@@ -102,6 +105,9 @@ def pdf_to_jpeg(file_bytes: bytes, original_filename: str) -> bytes:
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"Image conversion failed: {str(e)}")
+        raise ValueError(
+            "Image conversion failed: "
+            + describe_image_error(e, temp_file_path)
+        )
     finally:
         pdf.close()
