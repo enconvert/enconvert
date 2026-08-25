@@ -1,7 +1,8 @@
 import os
 import base64
 
-from ._limits import describe_image_error, svg_render_cap_kwargs, write_temp_file
+from ._limits import svg_render_cap_kwargs, write_temp_file
+from utils.error_capture import describe_image_error
 
 
 def jpeg_to_svg(file_bytes: bytes, original_filename: str) -> bytes:

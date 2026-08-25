@@ -1,6 +1,7 @@
 import os
 
-from ._limits import describe_image_error, ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
+from ._limits import ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
+from utils.error_capture import describe_image_error
 
 
 def svg_to_heic(file_bytes: bytes, original_filename: str) -> bytes:

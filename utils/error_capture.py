@@ -19,7 +19,40 @@ into a second failure on the error path.
 
 from __future__ import annotations
 
+import os
+import re
+import tempfile
 import traceback
+
+# Scratch directories the converters write uploads into. Anything under one
+# of these is a server path, never something a caller should be shown or an
+# admin should have to read past.
+_TEMP_DIRS = tuple(
+    d for d in dict.fromkeys((tempfile.gettempdir(), "/tmp", "/var/tmp")) if d
+)
+
+# Both spellings of each directory: libraries quote the path with repr(),
+# which DOUBLES backslashes, so the stored text reads
+# ``C:\\Users\\...\\Temp\\tmp89wyefon.png`` while the directory itself has
+# single ones. Matching only the raw form silently missed every Windows
+# path (POSIX ``/tmp`` has no separator to escape, so it always matched).
+_TEMP_DIR_VARIANTS = tuple(
+    dict.fromkeys(
+        variant
+        for d in _TEMP_DIRS
+        for variant in (d, d.replace("\\", "\\\\"))
+    )
+)
+
+# Anchored on those directories only, so ordinary prose is never touched.
+_TEMP_PATH_RE = re.compile(
+    "(?:"
+    + "|".join(re.escape(v) for v in _TEMP_DIR_VARIANTS)
+    + r")[\\/]{1,2}[^\s'\"]*",
+    re.IGNORECASE,
+)
+
+_PATH_PLACEHOLDER = "the uploaded file"
 
 # Upper bound on what we persist. Comfortably fits a deep Playwright or
 # SQLAlchemy traceback; guards against a pathological exception (e.g. one
@@ -67,6 +100,63 @@ def truncate_error(text: str | None, *, max_chars: int = MAX_ERROR_CHARS) -> str
     return text[:head] + marker + (text[-tail:] if tail else "")
 
 
+def scrub_temp_paths(text: str | None, *paths: str) -> str:
+    """Replace scratch-file paths with a neutral token.
+
+    Two sources, because both leak the same thing:
+
+    * ``paths`` — exact paths the caller knows it handed out, replaced
+      literally (and by basename, which is what some libraries quote).
+    * ``_TEMP_PATH_RE`` — anything under a system temp directory, which
+      catches the paths a library found on its own, deep in a chained
+      traceback the caller never sees.
+
+    Applies to BOTH destinations: the ``ValueError`` the routes turn into
+    the 400 body, and the traceback persisted on the activity row.
+    Scrubbing only the first left ``/tmp/tmp89wyefon.png`` sitting in the
+    admin error table.
+    """
+    if not text:
+        return text or ""
+    try:
+        for path in paths:
+            if not path:
+                continue
+            text = text.replace(path, _PATH_PLACEHOLDER)
+            base = os.path.basename(path)
+            if base:
+                text = text.replace(base, _PATH_PLACEHOLDER)
+        return _TEMP_PATH_RE.sub(_PATH_PLACEHOLDER, text)
+    except Exception:  # noqa: BLE001 - never raise from the error path
+        return text
+
+
+def describe_image_error(exc: BaseException, *paths: str) -> str:
+    """A caller-safe description of a failed image conversion.
+
+    The routes surface a converter's ``ValueError`` as the 400 body, so
+    whatever PIL or cairosvg said goes straight to the API caller. Two
+    problems came out of that:
+
+    * ``cannot identify image file '/tmp/tmp89wyefon.png'`` handed the
+      caller an internal filesystem path.
+    * It also told them nothing they could act on.
+
+    Duck-typed on the exception's class name so this module keeps no
+    imaging dependency.
+    """
+    if type(exc).__name__ == "UnidentifiedImageError":
+        return (
+            "the file could not be decoded as an image (its contents do not "
+            "match its extension, or it is corrupt or truncated)"
+        )
+    try:
+        message = str(exc)
+    except Exception:  # noqa: BLE001
+        return "the file could not be converted"
+    return scrub_temp_paths(message, *paths)
+
+
 def summarize_exception(exc: BaseException) -> str:
     """Single-line ``Type: message`` summary — the first stored line."""
     try:
@@ -90,7 +180,7 @@ def summarize_exception(exc: BaseException) -> str:
             text = repr(exc)
         except Exception:  # noqa: BLE001
             text = ""
-    single_line = " ".join(text.split())
+    single_line = scrub_temp_paths(" ".join(text.split()))
     return f"{name}: {single_line}" if single_line else name
 
 
@@ -104,9 +194,14 @@ def format_exception_detail(
     """
     summary = summarize_exception(exc)
     try:
-        chain = "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
-        ).strip()
+        # The chain carries every implicitly-chained cause, which is where
+        # the raw library message (and its scratch path) survives even when
+        # the outer ValueError was already cleaned.
+        chain = scrub_temp_paths(
+            "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ).strip()
+        )
     except Exception:  # noqa: BLE001 - never raise from the error path
         chain = ""
 

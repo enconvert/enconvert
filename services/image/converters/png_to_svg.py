@@ -1,7 +1,8 @@
 import os
 import base64
 
-from ._limits import describe_image_error, svg_render_cap_kwargs, write_temp_file
+from ._limits import svg_render_cap_kwargs, write_temp_file
+from utils.error_capture import describe_image_error
 
 # PNG signature (RFC 2083 §3.1).
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"

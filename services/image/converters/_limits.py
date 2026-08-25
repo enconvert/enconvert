@@ -82,33 +82,3 @@ def write_temp_file(file_bytes: bytes, suffix: str) -> str:
         os.unlink(temp_file.name)
         raise
     return temp_file.name
-
-
-def describe_image_error(exc: BaseException, *paths: str) -> str:
-    """A caller-safe description of a failed image conversion.
-
-    Two production problems, one helper:
-
-    * PIL and cairosvg quote the scratch file they were handed, and the
-      routes surface ``ValueError`` as the 400 body — so an internal
-      filesystem path (``/tmp/tmp89wyefon.png``) was being returned to
-      API callers and stored in the admin error table.
-    * ``cannot identify image file`` tells the caller nothing they can
-      act on. The actionable version names the real cause: the bytes are
-      not the format the extension claims.
-    """
-    name = type(exc).__name__
-    if name == "UnidentifiedImageError":
-        return (
-            "the file could not be decoded as an image (its contents do not "
-            "match its extension, or it is corrupt or truncated)"
-        )
-    message = str(exc)
-    for path in paths:
-        if not path:
-            continue
-        message = message.replace(path, "the uploaded file")
-        base = os.path.basename(path)
-        if base:
-            message = message.replace(base, "the uploaded file")
-    return message

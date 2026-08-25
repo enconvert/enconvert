@@ -1,5 +1,7 @@
 import io
 import os
+
+from utils.error_capture import describe_image_error
 import tempfile
 import zipfile
 
