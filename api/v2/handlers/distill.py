@@ -28,6 +28,7 @@ from api.v2.schemas.distill import DistillRequest, DistillResponse
 from monitoring import posthog_client
 from monitoring.metrics import log_activity_start, update_activity_status
 from services.v2_engine import distill_flow
+from services.v2_engine.url_safety import assert_public_http_url
 from utils.error_capture import error_fields
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,12 @@ async def distill(
     # free by routing through here.
     if body.discover_from is not None:
         check_v2_feature(user, "discover_enabled", "Discover")
+    # SSRF screen on explicit urls[] at the edge (400), matching perceive
+    # batch's assert_urls_public. Before this, a private-IP URL came back
+    # as a 200 with a failed row. discover_from's seed is screened inside
+    # discover_flow; discovered URLs are screened per-render.
+    for url in body.urls or []:
+        await assert_public_http_url(url)
 
     operation_id = f"dst_{uuid.uuid4().hex}"
     source = (

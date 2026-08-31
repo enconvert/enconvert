@@ -172,6 +172,15 @@ def apply_css_records(
     data: dict[str, Any] = {}
     warnings: list[str] = []
     if not records:
+        # ETL-096: a base selector that matches nothing must say so — the
+        # silent return made a typo'd selector indistinguishable from "the
+        # page has no such elements", and the caller paid the LLM pass for
+        # fields the free pass should have answered.
+        warnings.append(
+            "the CSS pass matched no records ('css_schema.baseSelector' "
+            "found nothing on the page); these fields fall through to the "
+            "LLM pass."
+        )
         return data, 0, warnings
 
     field_name = target_field
@@ -454,6 +463,10 @@ async def _distill_one_url_inner(
     data: dict[str, Any] = {}
     fields_from_css = 0
     if css_schema_dict is not None:
+        # None (not []) on timeout: apply_css_records treats an empty list
+        # as "the selector matched nothing" and warns about the selector —
+        # wrong and doubled when the pass never actually ran.
+        records: Optional[list[dict[str, Any]]] = None
         try:
             records = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -466,11 +479,11 @@ async def _distill_one_url_inner(
             item_warnings.append(
                 "CSS extraction timed out; fell back to the LLM pass."
             )
-            records = []
-        data, fields_from_css, css_warnings = apply_css_records(
-            props, records, target_field
-        )
-        item_warnings.extend(css_warnings)
+        if records is not None:
+            data, fields_from_css, css_warnings = apply_css_records(
+                props, records, target_field
+            )
+            item_warnings.extend(css_warnings)
 
     # Pass 2 — LLM (only the fields CSS missed, capped).
     missing = missing_fields(props, data)
@@ -497,6 +510,9 @@ async def _distill_one_url_inner(
                 plan_slug=plan_slug,
                 usage_key=usage_key,
                 feature="distill_extract",
+                # Verbatim non-HTML body (JSON/plain): the trim must not
+                # parse or Markdown-convert it (RenderedPage invariant).
+                content_category=rendered.content_category,
             )
             cost_cents = result.cost_cents
             llm_budget.spent += cost_cents
