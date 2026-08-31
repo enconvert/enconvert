@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Optional
 
 # Cheap import: utils.pdf_helpers defers WeasyPrint to inside render_media_pdf.
 from utils.pdf_helpers import explicit_geometry_fields
+from ._limits import ensure_svg_depth
 
 from ._limits import ensure_pixel_limit
 
@@ -127,6 +128,9 @@ def svg_to_pdf(
     embedded as a data URI and laid out by WeasyPrint, which honours margins /
     headers / footers that CairoSVG cannot express — and stays vector.
     """
+    # Both branches parse the SVG recursively. Outside the try so the depth
+    # rejection reaches the caller as itself, not wrapped in a second message.
+    ensure_svg_depth(file_bytes)
     try:
         if not _wants_geometry(pdf_options):
             import cairosvg

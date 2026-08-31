@@ -1,6 +1,11 @@
 import os
 
-from ._limits import ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
+from ._limits import (
+    ensure_pixel_limit,
+    ensure_svg_depth,
+    svg_render_cap_kwargs,
+    write_temp_file,
+)
 from utils.error_capture import describe_image_error
 
 
@@ -13,6 +18,8 @@ def svg_to_heic(file_bytes: bytes, original_filename: str) -> bytes:
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext != ".svg":
         raise ValueError("Expected an SVG file (.svg)")
+    # Bound nesting before CairoSVG's recursive parser sees the bytes.
+    ensure_svg_depth(file_bytes)
 
     # This endpoint takes no width/height, so always cap the intrinsic render:
     # a tiny SVG declaring a huge canvas would otherwise make cairo allocate a

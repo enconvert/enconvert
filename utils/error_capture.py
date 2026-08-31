@@ -150,6 +150,17 @@ def describe_image_error(exc: BaseException, *paths: str) -> str:
             "the file could not be decoded as an image (its contents do not "
             "match its extension, or it is corrupt or truncated)"
         )
+    # CairoSVG parses and renders recursively, so a deeply nested SVG -- or a
+    # <use> cycle, which no pre-parse depth check can see -- comes back as a
+    # bare "maximum recursion depth exceeded". That names a Python internal,
+    # not anything the caller can act on, and it lands in the admin activity
+    # table looking like a server crash rather than rejected input.
+    if isinstance(exc, RecursionError):
+        return (
+            "the file is nested too deeply to render (an SVG whose elements "
+            "nest beyond the renderer's limit, or whose <use> elements "
+            "reference each other in a cycle)"
+        )
     try:
         message = str(exc)
     except Exception:  # noqa: BLE001

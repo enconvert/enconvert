@@ -1,7 +1,7 @@
 import os
 import base64
 
-from ._limits import svg_render_cap_kwargs, write_temp_file
+from ._limits import ensure_svg_depth, svg_render_cap_kwargs, write_temp_file
 from utils.error_capture import describe_image_error
 
 # PNG signature (RFC 2083 §3.1).
@@ -80,6 +80,8 @@ def svg_to_png(
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext != ".svg":
         raise ValueError("Expected an SVG file (.svg)")
+    # Bound nesting before CairoSVG's recursive parser sees the bytes.
+    ensure_svg_depth(file_bytes)
     if (width is not None and width <= 0) or (height is not None and height <= 0):
         raise ValueError("width and height must be positive integers")
 

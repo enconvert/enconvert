@@ -65,6 +65,57 @@ def svg_render_cap_kwargs(svg_bytes: bytes) -> dict[str, int]:
     }
 
 
+# Max element nesting depth accepted in an SVG. CairoSVG builds its node tree
+# RECURSIVELY -- one Python frame per nesting level (cairosvg/parser.py, the
+# Node(child, ...) construction) -- so a ~1000-level document exhausts the
+# interpreter stack mid-parse. Best case that surfaces as an opaque
+# "maximum recursion depth exceeded"; worst case the C stack goes first and
+# takes the whole worker down instead of the one request. Same rule as the
+# pixel cap above: bound it BEFORE the recursive parser is handed the bytes.
+# 512 is an order of magnitude past what real authoring tools emit
+# (Illustrator/Inkscape exports nest tens of levels), and well clear of
+# CPython's default 1000-frame ceiling.
+MAX_SVG_DEPTH: int = int(os.environ.get("SVG_MAX_DEPTH", "512"))
+
+
+def ensure_svg_depth(svg_bytes: bytes) -> None:
+    """Reject a pathologically nested SVG before CairoSVG recurses into it.
+
+    Uses expat directly rather than ElementTree: it reports elements through
+    callbacks and builds no tree, so this stays iterative and its own memory
+    is O(depth) instead of O(document) -- the check must not become the
+    allocation it exists to prevent.
+
+    Bytes expat cannot parse are passed through untouched: rejecting them
+    here would turn "not valid XML" into a nesting complaint, and CairoSVG
+    already reports that case with its own caller-safe message.
+    """
+    import xml.parsers.expat
+
+    depth = 0
+
+    def start(name, attrs):
+        nonlocal depth
+        depth += 1
+        if depth > MAX_SVG_DEPTH:
+            raise ValueError(
+                f"SVG is nested too deeply to render: its elements nest more "
+                f"than {MAX_SVG_DEPTH} levels deep"
+            )
+
+    def end(name):
+        nonlocal depth
+        depth -= 1
+
+    parser = xml.parsers.expat.ParserCreate()
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    try:
+        parser.Parse(svg_bytes, True)
+    except xml.parsers.expat.ExpatError:
+        return
+
+
 def write_temp_file(file_bytes: bytes, suffix: str) -> str:
     """Write bytes to a ``delete=False`` temp file and return its path.
 

@@ -1,6 +1,11 @@
 import os
 
-from ._limits import ensure_pixel_limit, svg_render_cap_kwargs, write_temp_file
+from ._limits import (
+    ensure_pixel_limit,
+    ensure_svg_depth,
+    svg_render_cap_kwargs,
+    write_temp_file,
+)
 from utils.error_capture import describe_image_error
 
 def svg_to_webp(
@@ -18,6 +23,8 @@ def svg_to_webp(
     ext = os.path.splitext(original_filename or "")[1].lower()
     if ext != ".svg":
         raise ValueError("Expected an SVG file (.svg)")
+    # Bound nesting before CairoSVG's recursive parser sees the bytes.
+    ensure_svg_depth(file_bytes)
     if (width is not None and width <= 0) or (height is not None and height <= 0):
         raise ValueError("width and height must be positive integers")
 
