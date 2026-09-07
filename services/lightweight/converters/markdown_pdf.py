@@ -1,6 +1,7 @@
 import markdown
 from models import PdfOptions
 from utils.pdf_helpers import build_weasyprint_page_css, weasyprint_zoom
+from services.markdown.common import decode_text_bytes
 
 
 def markdown_to_pdf(markdown_bytes: bytes, pdf_options: PdfOptions = None) -> bytes:
@@ -20,7 +21,7 @@ def markdown_to_pdf(markdown_bytes: bytes, pdf_options: PdfOptions = None) -> by
     # lazily so importing this module at startup keeps it off idle RAM.
     from weasyprint import HTML
     try:
-        markdown_str = markdown_bytes.decode('utf-8')
+        markdown_str = decode_text_bytes(markdown_bytes)
 
         # 'codehilite' (Pygments) is deliberately NOT enabled. Without a
         # matching Pygments stylesheet in the <style> block below, its per-token
@@ -103,7 +104,5 @@ def markdown_to_pdf(markdown_bytes: bytes, pdf_options: PdfOptions = None) -> by
 
         pdf_bytes = HTML(string=full_html).write_pdf(zoom=weasyprint_zoom(pdf_options))
         return pdf_bytes
-    except UnicodeDecodeError:
-        raise ValueError("Invalid Markdown encoding (expected UTF-8)")
     except Exception as e:
         raise ValueError(f"Markdown to PDF conversion failed: {str(e)}")

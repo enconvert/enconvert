@@ -20,8 +20,8 @@ def json_to_xml(json_bytes: bytes) -> bytes:
         ValueError: If JSON is invalid or conversion fails
     """
     try:
-        json_str = json_bytes.decode('utf-8')
-        data = xml_safe(json.loads(json_str))
+        # Raw bytes: json.loads auto-detects UTF-8/16/32 and skips a BOM.
+        data = xml_safe(json.loads(json_bytes))
 
         if isinstance(data, list):
             wrapped_data = {'root': {'item': data}}
@@ -59,8 +59,8 @@ def xml_to_json(xml_bytes: bytes) -> bytes:
         ValueError: If XML is invalid or conversion fails
     """
     try:
-        xml_str = xml_bytes.decode('utf-8')
-        data = xmltodict.parse(xml_str)
+        # Raw bytes: expat honours the XML encoding declaration (see csv_xml).
+        data = xmltodict.parse(xml_bytes)
 
         # Unwrap root element if it exists
         if isinstance(data, dict) and 'root' in data and len(data) == 1:

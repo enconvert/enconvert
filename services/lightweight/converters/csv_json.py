@@ -2,6 +2,8 @@ import json
 import csv
 from io import BytesIO, StringIO, TextIOWrapper
 
+from services.markdown.common import decode_text_bytes
+
 def csv_to_json(csv_bytes: bytes) -> bytes:
     """
     Convert CSV to JSON.
@@ -16,7 +18,7 @@ def csv_to_json(csv_bytes: bytes) -> bytes:
         ValueError: If CSV is invalid or conversion fails
     """
     try:
-        csv_str = csv_bytes.decode('utf-8')
+        csv_str = decode_text_bytes(csv_bytes)
         csv_reader = csv.DictReader(StringIO(csv_str))
         
         data = list(csv_reader)
@@ -32,8 +34,6 @@ def csv_to_json(csv_bytes: bytes) -> bytes:
         wrapper.flush()
 
         return buf.getvalue()
-    except UnicodeDecodeError:
-        raise ValueError("Invalid CSV encoding (expected UTF-8)")
     except ValueError:
         # Same doubling as json_to_csv: "CSV to JSON conversion failed:
         # CSV file is empty or has no valid rows".
@@ -55,8 +55,12 @@ def json_to_csv(json_bytes: bytes) -> bytes:
         ValueError: If JSON is invalid or conversion fails
     """
     try:
-        json_str = json_bytes.decode('utf-8')
-        data = json.loads(json_str)
+        # json.loads takes the raw bytes: it auto-detects UTF-8/16/32 per RFC 4627
+        # and skips a UTF-8 BOM. Pre-decoding left the BOM in the str and
+        # json.loads then died on it ("Unexpected UTF-8 BOM") -- BOM'd JSON is
+        # what Notepad and PowerShell's Out-File emit by default. An invalid
+        # encoding still raises UnicodeDecodeError, so the handler below stands.
+        data = json.loads(json_bytes)
 
         # A single object is one row. Rejecting it forced callers to wrap
         # their own payload in brackets for no reason.

@@ -3,6 +3,8 @@ import re
 import xmltodict
 from io import BytesIO, StringIO, TextIOWrapper
 
+from services.markdown.common import decode_text_bytes
+
 
 def _xml_name(key) -> str:
     """Coerce a user-supplied key into a legal XML element name."""
@@ -37,7 +39,7 @@ def csv_to_xml(csv_bytes: bytes) -> bytes:
         ValueError: If CSV is invalid or conversion fails
     """
     try:
-        csv_str = csv_bytes.decode('utf-8')
+        csv_str = decode_text_bytes(csv_bytes)
         csv_reader = csv.DictReader(StringIO(csv_str))
 
         data = list(csv_reader)
@@ -54,8 +56,6 @@ def csv_to_xml(csv_bytes: bytes) -> bytes:
         wrapper.flush()
 
         return buf.getvalue()
-    except UnicodeDecodeError:
-        raise ValueError("Invalid CSV encoding (expected UTF-8)")
     except ValueError:
         # Our own diagnostic above is already the final message; letting
         # it reach the generic handler doubled the text ("CSV to XML
@@ -79,8 +79,11 @@ def xml_to_csv(xml_bytes: bytes) -> bytes:
         ValueError: If XML is invalid or conversion fails
     """
     try:
-        xml_str = xml_bytes.decode('utf-8')
-        data = xmltodict.parse(xml_str)
+        # Parse from bytes: expat then honours the document's own encoding
+        # declaration (<?xml ... encoding="ISO-8859-1"?>) and UTF-16 BOMs.
+        # Pre-decoding as UTF-8 threw that away and rejected correctly-declared
+        # non-UTF-8 XML outright. Malformed input still raises ExpatError.
+        data = xmltodict.parse(xml_bytes)
 
         # Unwrap root element if it exists
         if isinstance(data, dict) and len(data) == 1:
@@ -116,8 +119,6 @@ def xml_to_csv(xml_bytes: bytes) -> bytes:
         csv_writer.writerows(data)
 
         return output.getvalue().encode('utf-8')
-    except UnicodeDecodeError:
-        raise ValueError("Invalid XML encoding (expected UTF-8)")
     except ValueError:
         # Our own diagnostic above is already the final message; letting
         # it reach the generic handler doubled the text ("CSV to XML

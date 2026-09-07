@@ -1,5 +1,7 @@
 import markdown
 
+from services.markdown.common import decode_text_bytes
+
 # Static page shell around the converted body, pre-encoded once at import.
 # The previous single f-string wrap materialised a second full-document str
 # plus its encoded copy on every request; now only the converted body is
@@ -155,7 +157,7 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
         ValueError: If Markdown is invalid or conversion fails
     """
     try:
-        markdown_str = markdown_bytes.decode('utf-8')
+        markdown_str = decode_text_bytes(markdown_bytes)
 
         # 'codehilite' (Pygments) deliberately NOT enabled: the page shell has
         # no Pygments stylesheet, so its per-token <span>s rendered with no
@@ -168,7 +170,5 @@ def markdown_to_html(markdown_bytes: bytes) -> bytes:
         )
 
         return b"".join((_HTML_HEAD, html_str.encode('utf-8'), _HTML_TAIL))
-    except UnicodeDecodeError:
-        raise ValueError("Invalid Markdown encoding (expected UTF-8)")
     except Exception as e:
         raise ValueError(f"Markdown to HTML conversion failed: {str(e)}")

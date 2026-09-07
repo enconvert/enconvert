@@ -15,8 +15,8 @@ def json_to_yaml(json_bytes: bytes) -> bytes:
         ValueError: If JSON is invalid or conversion fails
     """
     try:
-        json_str = json_bytes.decode('utf-8')
-        data = json.loads(json_str)
+        # Raw bytes: json.loads auto-detects UTF-8/16/32 and skips a BOM.
+        data = json.loads(json_bytes)
         
         yaml_str = yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
         
@@ -40,8 +40,8 @@ def yaml_to_json(yaml_bytes: bytes ) -> bytes:
         ValueError: If YAML is invalid or conversion fails
     """
     try:
-        yaml_str = yaml_bytes.decode('utf-8')
-        data = yaml.safe_load(yaml_str)
+        # Raw bytes: PyYAML does the spec's own UTF-8/UTF-16 BOM detection.
+        data = yaml.safe_load(yaml_bytes)
         
         json_str = json.dumps(data, indent=2, ensure_ascii=False)
         

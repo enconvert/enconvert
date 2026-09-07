@@ -16,8 +16,8 @@ def json_to_toml(json_bytes: bytes) -> bytes:
         ValueError: If JSON is invalid or conversion fails
     """
     try:
-        json_str = json_bytes.decode('utf-8')
-        data = json.loads(json_str)
+        # Raw bytes: json.loads auto-detects UTF-8/16/32 and skips a BOM.
+        data = json.loads(json_bytes)
 
         if isinstance(data, list):
             data = {"items": data}
