@@ -18,6 +18,9 @@ storage bookkeeping, and stamps deleted_at. A per-row failure records
 last_error and leaves the row PENDING for retry, capped at MAX_ATTEMPTS so a
 poison row can never cycle forever. One bad row never aborts the batch, and a
 bad tick never kills the loop.
+
+Each tick also runs ip_retention.purge_expired_ips (raw client IPs past their
+12-month retention) on the same schedule; that purge never raises.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from typing import Optional
 from sqlmodel import select
 
 from models import ScheduledDeletion
+from services import ip_retention
 from utils.postgres import get_db
 from utils.retention import _delete_and_reconcile
 
@@ -113,6 +117,7 @@ async def tick(now: Optional[datetime] = None) -> int:
         total += claimed
         if claimed < BATCH:
             break
+    await asyncio.to_thread(ip_retention.purge_expired_ips, moment)
     return total
 
 

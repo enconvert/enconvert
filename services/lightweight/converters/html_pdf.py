@@ -1,5 +1,5 @@
 from models import PdfOptions
-from utils.pdf_helpers import build_weasyprint_page_css, weasyprint_zoom
+from utils.pdf_helpers import build_weasyprint_page_css, render_html_pdf
 from services.markdown.common import decode_text_bytes
 
 
@@ -17,8 +17,6 @@ def html_to_pdf(html_bytes: bytes, pdf_options: PdfOptions = None) -> bytes:
     Raises:
         ValueError: If HTML is invalid or conversion fails
     """
-    # WeasyPrint imported lazily (kept off idle RAM until a PDF is rendered).
-    from weasyprint import HTML
     try:
         html_str = decode_text_bytes(html_bytes)
 
@@ -31,7 +29,7 @@ def html_to_pdf(html_bytes: bytes, pdf_options: PdfOptions = None) -> bytes:
             else:
                 html_str = f"<html><head>{page_css}</head><body>{html_str}</body></html>"
 
-        pdf_bytes = HTML(string=html_str).write_pdf(zoom=weasyprint_zoom(pdf_options))
+        pdf_bytes = render_html_pdf(html_str, pdf_options)
         return pdf_bytes
     except Exception as e:
         raise ValueError(f"HTML to PDF conversion failed: {str(e)}")

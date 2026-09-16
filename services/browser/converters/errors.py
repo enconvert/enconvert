@@ -140,6 +140,13 @@ def classify_render_failure(
         error_message = str(getattr(result, "error_message", "") or "")
     lowered = error_message.lower()
 
+    # Playwright aborts goto when the response is an attachment (e.g. an
+    # .ics/.zip export): the input is not a web page, so it's a 415, not a 502.
+    if "download is starting" in lowered:
+        return UnsupportedContentError(
+            f"{url} triggers a file download instead of loading a web page, "
+            f"so it cannot be rendered as {artifact}.",
+        )
     if any(marker in lowered for marker in _TIMEOUT_MARKERS):
         return UpstreamTimeoutError(
             f"The target site took too long to respond while rendering "

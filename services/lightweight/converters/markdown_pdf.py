@@ -1,6 +1,6 @@
 import markdown
 from models import PdfOptions
-from utils.pdf_helpers import build_weasyprint_page_css, weasyprint_zoom
+from utils.pdf_helpers import build_weasyprint_page_css, render_html_pdf
 from services.markdown.common import decode_text_bytes
 
 
@@ -17,9 +17,6 @@ def markdown_to_pdf(markdown_bytes: bytes, pdf_options: PdfOptions = None) -> by
     Raises:
         ValueError: If Markdown is invalid or conversion fails
     """
-    # WeasyPrint (Pango/cairo/fontconfig native stack, ~30-40MB) imported
-    # lazily so importing this module at startup keeps it off idle RAM.
-    from weasyprint import HTML
     try:
         markdown_str = decode_text_bytes(markdown_bytes)
 
@@ -102,7 +99,7 @@ def markdown_to_pdf(markdown_bytes: bytes, pdf_options: PdfOptions = None) -> by
 </body>
 </html>"""
 
-        pdf_bytes = HTML(string=full_html).write_pdf(zoom=weasyprint_zoom(pdf_options))
+        pdf_bytes = render_html_pdf(full_html, pdf_options)
         return pdf_bytes
     except Exception as e:
         raise ValueError(f"Markdown to PDF conversion failed: {str(e)}")

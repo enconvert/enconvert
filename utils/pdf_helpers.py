@@ -20,6 +20,7 @@ per file extension) and the LibreOffice-backed document endpoints (whose engine
 is fixed by the route). Two copies would drift into two different 400 bodies.
 """
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -171,6 +172,36 @@ def weasyprint_zoom(pdf_options) -> float:
     size stays fixed while the content scales.
     """
     return pdf_options.scale if pdf_options else 1.0
+
+
+# WeasyPrint builds its box tree RECURSIVELY -- roughly six Python frames per
+# level of DOM nesting (element_to_box, plus the inherited-style __missing__
+# chain each box walks up). CPython's default 1000-frame ceiling therefore caps
+# rendering at ~170 levels, and a legitimate 494-level document came back as
+# "maximum recursion depth exceeded". Frames are heap-allocated since 3.11, so
+# this headroom costs nothing until a document uses it, and CPython's separate
+# C-recursion guard still raises a clean RecursionError -- never a stack
+# overflow -- for anything deeper still.
+_RECURSION_HEADROOM = 8000
+
+
+def render_html_pdf(html_str: str, pdf_options) -> bytes:
+    """Render an HTML string to PDF with the geometry/zoom pair applied.
+
+    The single WeasyPrint entry point for the document converters, so the
+    recursion headroom above and the zoom pairing are set once rather than
+    per converter.
+    """
+    # WeasyPrint (Pango/cairo/fontconfig native stack, ~30-40MB) imported
+    # lazily to keep it off idle RAM until a PDF is actually rendered.
+    from weasyprint import HTML
+
+    if sys.getrecursionlimit() < _RECURSION_HEADROOM:
+        sys.setrecursionlimit(_RECURSION_HEADROOM)
+    try:
+        return HTML(string=html_str).write_pdf(zoom=weasyprint_zoom(pdf_options))
+    except RecursionError:
+        raise ValueError("its elements nest too deeply to render")
 
 
 def render_media_pdf(
