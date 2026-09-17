@@ -79,7 +79,7 @@ FOUNDER_CALL_SLOTS_PER_WEEK = int(os.getenv("FOUNDER_CALL_SLOTS_PER_WEEK", "5"))
 RATE_LIMITS = {
     "free": {
         "private": {
-            "per_minute": 5,
+            "per_minute": 30,
             "per_hour": 100,
             "per_day": 1000,
         },
@@ -117,7 +117,7 @@ RATE_LIMITS = {
         "private": {
             "per_minute": 300,
             "per_hour": 6000,
-            "per_day": 600000,
+            "per_day": 60000,
         },
         "public": {
             "per_minute": 150,

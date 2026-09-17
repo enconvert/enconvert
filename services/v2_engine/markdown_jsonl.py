@@ -140,8 +140,14 @@ def build_record(
     title: str,
     index: int,
     id_seed: str | None = None,
+    render_quality: float | None = None,
+    deductions: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build one JSONL record dict from a chunk (plan section 8 step 4).
+
+    ``render_quality``/``deductions`` are the F.7 verdict of the page's
+    render and appear in ``metadata`` only when given: uploaded files are
+    never rendered, so their records keep the original shape.
 
     ``id_seed`` is the value the id slug is hashed from; it defaults to
     ``source_url``. They diverge for FILE pages, whose ``source_url`` is the
@@ -163,17 +169,21 @@ def build_record(
     # label sanitizer existed. Only the no-seed fallback hashes the sanitized
     # label, so a direct caller's id and metadata.source_url stay consistent.
     seed = id_seed if id_seed is not None else safe_source
+    metadata: dict[str, Any] = {
+        "source_url": safe_source,
+        "title": safe_title,
+        "headings_path": list(chunk.headings_path),
+        "section": chunk.section,
+        "word_count": chunk.word_count,
+        "chunk_index": index,
+    }
+    if render_quality is not None:
+        metadata["render_quality"] = render_quality
+        metadata["deductions"] = dict(deductions or {})
     return {
         "id": f"{_page_slug(seed)}-{index:04d}",
         CONTENT_KEY: sanitize_content(chunk.text),
-        "metadata": {
-            "source_url": safe_source,
-            "title": safe_title,
-            "headings_path": list(chunk.headings_path),
-            "section": chunk.section,
-            "word_count": chunk.word_count,
-            "chunk_index": index,
-        },
+        "metadata": metadata,
     }
 
 
@@ -184,6 +194,8 @@ def page_records(
     title: str,
     start_index: int = 0,
     id_seed: str | None = None,
+    render_quality: float | None = None,
+    deductions: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """All JSONL records for one page's chunks, in order."""
     return [
@@ -193,6 +205,8 @@ def page_records(
             title=title,
             index=start_index + i,
             id_seed=id_seed,
+            render_quality=render_quality,
+            deductions=deductions,
         )
         for i, chunk in enumerate(chunks)
     ]

@@ -42,6 +42,9 @@ class ConversionError(Exception):
 
     status_code: int = 500
     code: str = "conversion_error"
+    # Set by a handler that already created an operation row (/v2/perceive)
+    # so main.py can return it as X-Operation-Id for support correlation.
+    operation_id: Optional[str] = None
 
     def __init__(
         self,
@@ -92,6 +95,19 @@ class EmptyRenderError(ConversionError):
     code = "empty_render"
 
 
+class BrowserCrashedError(ConversionError):
+    """Chromium (or the page's renderer) died mid-render (503).
+
+    Our fault, not the target's: the browser is relaunched on the next slot
+    acquisition (``BrowserManager.ensure_browser_ready``), so the caller
+    should simply retry. Used to surface as a 502 "empty render", which
+    blamed the target site for our crash.
+    """
+
+    status_code = 503
+    code = "browser_restarting"
+
+
 class UnsupportedContentError(ConversionError):
     """The URL returned non-HTML content this converter cannot render (415)."""
 
@@ -109,6 +125,16 @@ class SelectorNotFoundError(ConversionError):
 # Substrings that identify the failure class inside crawl4ai/Playwright
 # error messages. Ordered most-specific first. These are our own heuristics
 # over the underlying engine's free-text messages.
+# Playwright's TargetClosedError default text plus the older "Target closed"
+# / driver-connection variants a dying Chromium produces.
+_BROWSER_CRASH_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "target closed",
+    "browser closed",
+    "browser crashed",
+    "connection closed while reading",
+)
 _TIMEOUT_MARKERS = ("timeout", "timed out", "exceeded")
 _UNREACHABLE_MARKERS = (
     "net::err_name_not_resolved",
@@ -131,9 +157,10 @@ def classify_render_failure(
     """Map a crawl4ai result with no captured artifact to a typed error.
 
     ``artifact`` names what we expected ("PDF", "screenshot", "HTML") for a
-    clear message. Inspects ``result.error_message`` to decide whether the
-    target timed out (504), was unreachable (502), or the render simply came
-    back empty (502). Never raises; always returns a ``ConversionError``.
+    clear message. Inspects ``result.error_message`` to decide whether our
+    browser died (503), the target timed out (504), was unreachable (502),
+    or the render simply came back empty (502). Never raises; always
+    returns a ``ConversionError``.
     """
     error_message = ""
     if result is not None:
@@ -146,6 +173,11 @@ def classify_render_failure(
         return UnsupportedContentError(
             f"{url} triggers a file download instead of loading a web page, "
             f"so it cannot be rendered as {artifact}.",
+        )
+    if any(marker in lowered for marker in _BROWSER_CRASH_MARKERS):
+        return BrowserCrashedError(
+            f"The rendering browser restarted while rendering {artifact} "
+            f"for {url}. Retry in a few seconds.",
         )
     if any(marker in lowered for marker in _TIMEOUT_MARKERS):
         return UpstreamTimeoutError(

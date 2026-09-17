@@ -9,12 +9,13 @@ deps.py, and add the redis package to requirements. Do NOT simply point
 network I/O on the event loop for every request.
 
 These are short-window FAIRNESS limits (HTTP 429), separate from the monthly
-conversion quotas enforced in api/deps.py (HTTP 402). Enforcement self-gates on
-RATE_LIMITING_ENABLED so the wiring can ship inert and be switched on in
-production when ready. The `limits` import is guarded so the gateway still
+conversion quotas enforced in api/deps.py (HTTP 402). Enforcement is ON by
+default; RATE_LIMITING_ENABLED=false switches it off (a load test, a local
+dev box). The `limits` import is guarded so the gateway still
 starts if the package is not yet installed, and a bad storage URI disables
 limiting (with a logged error) instead of preventing boot.
 """
+import ipaddress
 import logging
 import os
 import time
@@ -22,6 +23,7 @@ import time
 from fastapi import HTTPException, Request
 
 from config import RATE_LIMITS
+from utils.client_ip import is_proxy_address, peer_address, resolve_client_ip
 
 logger = logging.getLogger("conversion-api-gateway")
 
@@ -38,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     _LIMITS_AVAILABLE = False
 
-_ENABLED = os.getenv("RATE_LIMITING_ENABLED", "false").lower() == "true"
+_ENABLED = os.getenv("RATE_LIMITING_ENABLED", "true").lower() == "true"
 _STORAGE_URI = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
 
 # Per-IP backstop for PUBLIC-key traffic. A public (pk_) key is shared by every
@@ -48,6 +50,13 @@ _STORAGE_URI = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
 # project window on every tier.
 _PUBLIC_IP_PER_MINUTE = int(os.getenv("PUBLIC_IP_RATE_PER_MINUTE", "0"))
 _PUBLIC_IP_PER_HOUR = int(os.getenv("PUBLIC_IP_RATE_PER_HOUR", "0"))
+
+# Per-IP caps for the anonymous playground: a public (pk_) key on the admin
+# default project. The admin plan has no tier windows, so this bucket is the
+# only app-layer throttle between a visitor's 1 h JWT and the single
+# Chromium slot (MAX_CONCURRENT_CONTEXTS=1).
+_PLAYGROUND_IP_PER_MINUTE = int(os.getenv("PLAYGROUND_IP_PER_MINUTE", "10"))
+_PLAYGROUND_IP_PER_HOUR = int(os.getenv("PLAYGROUND_IP_PER_HOUR", "60"))
 
 # Token minting (pk_ -> JWT) gets its own per-IP bucket and does NOT consume
 # the tier windows — otherwise every widget visitor costs 2 units (mint +
@@ -131,12 +140,52 @@ def _public_ip_caps(cfg: dict) -> tuple:
     return per_minute, per_hour
 
 
+_warned_collapsed_ip = False
+
+
+def _client_ip(request: Request) -> str:
+    """Visitor IP for the per-IP buckets, warning once if it is not a visitor.
+
+    An unresolvable visitor (a Cloudflare peer without a valid
+    CF-Connecting-IP) is bucketed on its resolved peer (the edge nginx saw,
+    not the loopback socket) rather than "", which would put every such
+    request everywhere into one bucket. If the key is still loopback or a
+    Cloudflare edge, restoration failed and every visitor behind that address
+    shares one bucket, so the 2/min mint bucket becomes a site-wide cap: make
+    that visible in the logs instead of as a 429 storm.
+
+    IPv6 keys are the visitor's /64: one ordinary allocation is a whole /64,
+    so a per-address bucket could be rotated around without limit.
+    """
+    global _warned_collapsed_ip
+    client_ip = resolve_client_ip(request) or peer_address(request) or "unknown"
+    if not _warned_collapsed_ip and is_proxy_address(client_ip):
+        _warned_collapsed_ip = True
+        logger.warning(
+            "Rate limiter saw client IP %r: per-IP buckets are collapsed "
+            "onto a proxy address; check the Cloudflare -> nginx -> uvicorn "
+            "chain (CF-Connecting-IP, X-Real-IP / X-Forwarded-For, "
+            "forwarded_allow_ips)",
+            client_ip,
+        )
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return client_ip
+    if ip.version == 6:
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return client_ip
+
+
 def enforce(request: Request, user: dict) -> None:
     """Raise HTTP 429 if the caller exceeded its plan's request-rate limit.
 
     No-op unless rate limiting is enabled (and the `limits` package is present)
-    and the request is a billable POST. Admin projects bypass. Safe to call on
-    every authenticated request.
+    and the request is a billable POST. The admin plan bypasses the tier
+    windows, but its PUBLIC key (the anonymous playground JWT) still gets a
+    per-IP mint bucket and a per-IP backstop, both at the playground caps.
+    Safe to call on every authenticated
+    request.
     """
     if not (_ENABLED and _LIMITS_AVAILABLE):
         return
@@ -145,22 +194,35 @@ def enforce(request: Request, user: dict) -> None:
 
     sub = user.get("subscription", {})
     plan = sub.get("plan_slug", "free")
-    if plan == "admin":
-        return
-
     key_type = "public" if user.get("key_type") == "public" else "private"
+    if plan == "admin" and key_type != "public":
+        return  # the founder's own sk_ key
+
     tier_cfg = RATE_LIMITS.get(plan, RATE_LIMITS["free"])
     limits_cfg = tier_cfg.get(key_type, tier_cfg["private"])
 
     project_id = str(user.get("id", "anonymous"))
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
 
     # Token minting: own per-IP bucket, never charged to the tier windows.
     if request.url.path.endswith("/auth/token"):
+        # The playground (/playground, /convert/*, /check) mints one JWT per
+        # conversion, so the 2/min customer-widget mint cap would 429 a person
+        # converting their third file. Its billable POSTs are already capped
+        # per IP below, whatever the number of tokens, so its mint bucket
+        # matches those caps instead.
+        # ponytail: Turnstile is only verified when Origin == WIDGET_ORIGIN
+        # (api/v1/auth.py); requiring it on every playground mint would let
+        # this bucket go, once no caller of the playground key lacks Turnstile.
+        mint_minute, mint_hour = (
+            (_PLAYGROUND_IP_PER_MINUTE, _PLAYGROUND_IP_PER_HOUR)
+            if plan == "admin"
+            else (_MINT_PER_MINUTE, _MINT_PER_HOUR)
+        )
         _enforce_windows(
             [
-                (RateLimitItemPerMinute(_MINT_PER_MINUTE), _MINT_PER_MINUTE),
-                (RateLimitItemPerHour(_MINT_PER_HOUR), _MINT_PER_HOUR),
+                (RateLimitItemPerMinute(mint_minute), mint_minute),
+                (RateLimitItemPerHour(mint_hour), mint_hour),
             ],
             "mint",
             project_id,
@@ -170,7 +232,11 @@ def enforce(request: Request, user: dict) -> None:
 
     # Per-IP backstop for shared public keys (keyed by project + client IP).
     if key_type == "public":
-        ip_minute, ip_hour = _public_ip_caps(limits_cfg)
+        ip_minute, ip_hour = (
+            (_PLAYGROUND_IP_PER_MINUTE, _PLAYGROUND_IP_PER_HOUR)
+            if plan == "admin"
+            else _public_ip_caps(limits_cfg)
+        )
         _enforce_windows(
             [
                 (RateLimitItemPerMinute(ip_minute), ip_minute),
@@ -180,6 +246,8 @@ def enforce(request: Request, user: dict) -> None:
             project_id,
             client_ip,
         )
+    if plan == "admin":
+        return  # playground: per-IP backstop only, the admin plan has no tier
 
     # Per-project tier limits, namespaced by key_type so public and private
     # traffic do not share a bucket.
@@ -203,7 +271,7 @@ def enforce_ip(
 
     per_minute = per_minute or _MINT_PER_MINUTE
     per_hour = per_hour or _MINT_PER_HOUR
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     _enforce_windows(
         [
             (RateLimitItemPerMinute(per_minute), per_minute),

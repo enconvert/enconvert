@@ -78,6 +78,7 @@ from services.v2_engine.page_markdown import (
     full_page_markdown,
     main_content_markdown,
 )
+from services.v2_engine.quality import QUALITY_FLOOR
 from services.v2_engine.markdown_jsonl import (
     encode_jsonl,
     page_records,
@@ -422,8 +423,14 @@ async def _discover_urls(
 
 async def _url_to_markdown(
     page: IngestPage, render: dict[str, Any], markdown: dict[str, Any]
-) -> tuple[str, str, str, str]:
-    """Render a URL page to (markdown, title, source_ref, final_url).
+) -> tuple[str, str, str, str, dict[str, Any]]:
+    """Render a URL page to (markdown, title, source_ref, final_url, quality).
+
+    ``quality`` is ``{"render_quality": float, "deductions": {...}}`` and
+    rides into every chunk's metadata. Raises ``BlockedPageError`` before
+    the Markdown pass when the render is blocked or scores under
+    QUALITY_FLOOR: a login wall, soft-404 or challenge page WITH text used
+    to be chunked, billed and shipped in the corpus.
 
     ``allow_tls=False`` is deliberate. The engine ladder's TLS rung is a
     plain HTTP fetch with no JavaScript, and the render-quality scorer
@@ -447,6 +454,19 @@ async def _url_to_markdown(
         wait_timeout_ms=int(render.get("wait_timeout_ms", 30000)),
         allow_tls=False,
     )
+    # RenderedPage grows ``deductions`` in the perceive track; until it
+    # lands the metadata carries an empty map rather than crashing ingest.
+    deductions = dict(getattr(rendered, "deductions", None) or {})
+    if rendered.is_blocked or rendered.render_quality < QUALITY_FLOOR:
+        names = ", ".join(sorted(deductions)) or "below quality floor"
+        raise BlockedPageError(
+            f"the page could not be read (render_quality "
+            f"{rendered.render_quality:.2f}; {names})"
+        )
+    quality = {
+        "render_quality": rendered.render_quality,
+        "deductions": deductions,
+    }
     html = rendered.html or ""
     final_url = rendered.final_url or page.url
     # Both are CPU-bound bs4/markdown passes over a page that can be
@@ -466,7 +486,7 @@ async def _url_to_markdown(
     # is returned alongside it because the post-redirect address is the
     # page's real identity — two discovered URLs that redirect to the same
     # place are one page (see _process_one_page's duplicate handling).
-    return text, title, page.url, final_url
+    return text, title, page.url, final_url, quality
 
 
 async def _file_to_markdown(page: IngestPage) -> tuple[str, str, str]:
@@ -499,6 +519,15 @@ class EmptyPageError(Exception):
     """
 
 
+class BlockedPageError(EmptyPageError):
+    """The render was blocked or scored under QUALITY_FLOOR.
+
+    Subclasses EmptyPageError so it takes the same skip path: the page is
+    recorded ``skipped`` with the reason, contributes no chunks and is not
+    billed (billing happens only after _process_one_page returns).
+    """
+
+
 async def _process_one_page(
     job: IngestJob,
     page: IngestPage,
@@ -527,10 +556,11 @@ async def _process_one_page(
     """
     seen = PageIdentitySet() if seen is None else seen
     final_url: Optional[str] = None
+    quality: dict[str, Any] = {}  # files are not rendered, so never scored
     if page.source_type == "file":
         markdown, title, source_ref = await _file_to_markdown(page)
     else:
-        markdown, title, source_ref, final_url = await _url_to_markdown(
+        markdown, title, source_ref, final_url, quality = await _url_to_markdown(
             page, render, markdown_cfg or {}
         )
 
@@ -556,7 +586,7 @@ async def _process_one_page(
     # id_seed is the page's unique identity (URL, or the uploaded file's object
     # key); source_ref is only the display label and is NOT unique for files.
     records = page_records(
-        chunks, source_url=source_ref, title=title, id_seed=page.url
+        chunks, source_url=source_ref, title=title, id_seed=page.url, **quality
     )
     blob = encode_jsonl(records)
 
@@ -773,11 +803,12 @@ async def process_job(job_id: str) -> None:
             raise  # shutdown: leave the row 'processing'; resumed next boot
         except EmptyPageError as exc:
             # Not a crash and not a success: the render/convert worked but
-            # there was nothing to chunk. Recorded as a skip so the job's
-            # counters stay honest instead of reporting a completed page
-            # that contributed an empty file.
+            # there was nothing worth chunking (empty body, or a blocked /
+            # sub-floor render via BlockedPageError). Recorded as a skip so
+            # the job's counters stay honest instead of reporting a
+            # completed page that contributed an empty file.
             logger.info(
-                "ingest %s: no extractable content for %s", job_id, _safe(page.url)
+                "ingest %s: skipping %s: %s", job_id, _safe(page.url), exc
             )
             await asyncio.to_thread(ingest_store.skip_page, page.id, str(exc))
             failed += 1

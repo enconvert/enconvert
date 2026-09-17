@@ -135,10 +135,10 @@ class PerceiveOptionsBase(BaseModel):
     )
     allow_degraded: bool = Field(
         default=False,
-        description="When true, return the render even if it is an "
-        "anti-bot challenge or block page with no page content. By "
-        "default such a render fails with 502 rather than delivering "
-        "the interstitial's text as if it were the page.",
+        description="Deprecated and ignored. A content-free anti-bot block "
+        "now always returns 200 with is_blocked=true, the render-quality "
+        "deductions and no artifacts (it is not billed). Sending true "
+        "adds a deprecation warning to the response.",
     )
     direct_download: bool = Field(
         default=False,
@@ -232,6 +232,18 @@ class PerceiveResponse(BaseModel):
         default_factory=dict,
         description="Named render-quality deductions that fired for this "
         "render (e.g. {'http_error': 0.7}). Empty on a clean render.",
+    )
+    is_blocked: bool = Field(
+        default=False,
+        description="True when the scorer judged the render an anti-bot "
+        "challenge or WAF block page. A block with no page content behind "
+        "it returns 200 with this flag set and outputs={}.",
+    )
+    billed: bool = Field(
+        default=False,
+        description="Whether this operation consumed one op from the "
+        "monthly quota. False for blocked reads and for renders whose "
+        "deductions include http_error or login_wall; cache hits bill.",
     )
     options_echo: Optional[dict[str, Any]] = Field(
         default=None,

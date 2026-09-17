@@ -22,7 +22,7 @@ from api.deps import get_current_user
 from api.v2.schemas.perceive import PerceiveResponse, PerceiveTokens
 from models import PerceiveOperation
 from services.v2_engine import operations
-from services.v2_engine.perceive_flow import outputs_from_keys
+from services.v2_engine.perceive_flow import is_billable, outputs_from_keys
 from utils.storage import download_from_storage
 
 router = APIRouter()
@@ -43,7 +43,12 @@ async def perceive_status(
     if op is None or str(op.project_id) != str(user["id"]):
         raise HTTPException(status_code=404, detail="Operation not found")
     response = _response_from_operation(op)
-    if not direct_download:
+    # An unbilled read (block, HTTP error, login wall) has no artifact;
+    # the JSON verdict is the body. Failed/pending rows still get the
+    # stream_artifact 404 that says so.
+    if not direct_download or (
+        response.status == "completed" and not response.billed
+    ):
         return response
     return await stream_artifact(response, output)
 
@@ -116,6 +121,13 @@ async def stream_artifact(
 
 def _response_from_operation(op: PerceiveOperation) -> PerceiveResponse:
     keys = op.output_keys or {}
+    deductions = dict(keys.get(operations.DEDUCTIONS_KEY) or {})
+    is_blocked = bool(op.is_blocked)
+    # Same predicate as the POST path, so a poll never disagrees with the
+    # original response about whether the read cost an op.
+    billed = op.status == "completed" and (
+        bool(op.cache_hit) or is_billable(is_blocked, deductions)
+    )
     return PerceiveResponse(
         operation_id=op.operation_id,
         status=op.status,  # type: ignore[arg-type]
@@ -124,7 +136,9 @@ def _response_from_operation(op: PerceiveOperation) -> PerceiveResponse:
         content_hash=op.content_hash,
         status_code=keys.get(operations.HTTP_STATUS_KEY),
         render_quality=op.render_quality_score,
-        deductions=dict(keys.get(operations.DEDUCTIONS_KEY) or {}),
+        deductions=deductions,
+        is_blocked=is_blocked,
+        billed=billed,
         cache_hit=op.cache_hit,
         outputs=outputs_from_keys(op.output_keys, op.project_id),
         structured=op.structured_data,

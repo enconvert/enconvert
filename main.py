@@ -25,9 +25,13 @@ from services.browser.converters.browser_manager import (
     BrowserManager,
     get_browser_manager,
 )
-from services.browser.converters.errors import ConversionError
+from services.browser.converters.errors import (
+    BrowserCrashedError,
+    ConversionError,
+)
 from services.v2_engine import batch_worker, ingest_worker, watch_worker
 from utils import memory
+from utils.client_ip import resolve_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -349,8 +353,22 @@ async def conversion_error_handler(request: Request, exc: ConversionError):
     apart. These are expected conversion outcomes already tracked via the
     conversion_failed analytics event in the processor, so they are NOT
     re-captured as exceptions here.
+
+    A browser crash (503) also queues a relaunch now, so the client's
+    Retry-After lands on a warm browser instead of paying the ~1-2s restart
+    that ensure_browser_ready() would otherwise do inside the retry. The
+    crashed request's slot is already released by the time this runs.
     """
-    return JSONResponse(status_code=exc.status_code, content=exc.to_envelope())
+    if isinstance(exc, BrowserCrashedError) and BrowserManager._instance:
+        BrowserManager._instance.schedule_recovery(
+            f"browser crashed while rendering {request.url.path}"
+        )
+    headers = {"Retry-After": "5"} if exc.status_code == 503 else {}
+    if exc.operation_id:
+        headers["X-Operation-Id"] = exc.operation_id
+    return JSONResponse(
+        status_code=exc.status_code, content=exc.to_envelope(), headers=headers
+    )
 
 
 @app.exception_handler(Exception)
@@ -361,7 +379,7 @@ def global_exception_handler(request: Request, exc: Exception):
     log_security_event("error", {
         "path": request.url.path,
         "error": str(exc),
-        "client_ip": request.client.host
+        "client_ip": resolve_client_ip(request)
     })
 
     # Report to PostHog with a stack trace; get_current_user stamps the
@@ -400,8 +418,10 @@ if __name__ == "__main__":
         reload=os.getenv("ENV", "production") == "development",
         loop="asyncio",
         # Trust X-Forwarded-For from the local nginx reverse proxy so
-        # request.client.host is the real client IP (not 127.0.0.1) for
-        # logging, widget abuse tracking, and per-IP rate limiting.
+        # request.client.host is the address nginx saw (the visitor: nginx
+        # restores it from CF-Connecting-IP), not 127.0.0.1; utils/client_ip.py
+        # still resolves a Cloudflare edge if one gets through, for logging,
+        # Turnstile, and per-IP rate limiting.
         proxy_headers=True,
         forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
     )

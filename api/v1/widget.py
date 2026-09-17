@@ -7,6 +7,7 @@ import logging
 from models import Widget, APIKeys, Subscription, Plan
 from rate_limiting.limiter import enforce_ip
 from utils.postgres import get_session
+from utils.client_ip import resolve_client_ip
 from utils.turnstile import verify_turnstile
 from utils.validators import is_domain_allowed
 from utils.subscription import get_subscription, is_project_owner_active
@@ -125,7 +126,7 @@ async def get_widget_token(
     if not body.turnstile_token:
         raise HTTPException(status_code=400, detail="Turnstile token required")
 
-    await verify_turnstile(body.turnstile_token, request.client.host if request.client else None)
+    await verify_turnstile(body.turnstile_token, resolve_client_ip(request))
 
     # 4. Look up plan slug from subscription
     sub = db.exec(select(Subscription).where(

@@ -106,7 +106,12 @@ def validate_api_key(api_key: str, request: Request) -> dict:
     if key_type == "private" and is_browser_request:
         db.close()
         logger.warning(f"API key validation failed: private key used from browser (origin={origin})")
-        raise HTTPException(status_code=403, detail="Private API keys cannot be used from browsers")
+        raise HTTPException(
+            status_code=403,
+            detail="Private API keys cannot be used from browsers. Use a public "
+            "pk_ key for browser calls or send this request from your server. "
+            "https://www.enconvert.com/docs/authentication",
+        )
 
     if key_type == "public" and is_browser_request:
         allowed_domains = key_data.allowed_domains or []

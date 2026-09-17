@@ -440,6 +440,23 @@ async def _render_basic(
             await context.close()
 
 
+def is_billable(is_blocked: bool, deductions: dict[str, float]) -> bool:
+    """Same predicate the open handlers import (GET/batch ``billed``).
+
+    The open build has no scorer, so its rows carry no block flag or
+    deductions and every completed read bills.
+    """
+    return not is_blocked and not ({"http_error", "login_wall"} & set(deductions))
+
+
+def is_anonymous_playground(user: dict) -> bool:
+    """True for a JWT minted from a public key on the admin project."""
+    return (
+        user.get("key_type") == "public"
+        and (user.get("subscription") or {}).get("plan_slug") == "admin"
+    )
+
+
 @dataclass(frozen=True)
 class RenderedPage:
     """The DOM from one lightweight render (open-fallback shape).
@@ -617,6 +634,7 @@ async def run(
             url_final=captured.final_url,
             content_hash=content_hash,
             render_quality=None,
+            billed=True,
             options_echo=_options_echo(request, outputs),
             cache_hit=False,
             outputs=outputs_from_keys(output_keys, project_id),
@@ -691,6 +709,7 @@ def _serve_from_cache(
         status_code=cached_keys.get(operations.HTTP_STATUS_KEY),
         render_quality=cached.render_quality_score,
         deductions=dict(cached_keys.get(operations.DEDUCTIONS_KEY) or {}),
+        billed=True,
         options_echo=(
             _options_echo(request, outputs) if request is not None else None
         ),

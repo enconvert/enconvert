@@ -4,8 +4,8 @@ Owns one long-lived headless Chromium through a Crawl4AI
 ``AsyncWebCrawler`` (no stealth, no engine ladder — those live in the
 cloud build) and exposes the same public surface the open code uses:
 ``BrowserManager`` (``get_instance``, ``crawler_slot``, ``get_context``,
-``get_page``, ``get_crawler``, ``force_recover``, ``stats``,
-``is_browser_healthy``, ``shutdown``, ``reset_instance``, ``_instance``,
+``get_page``, ``get_crawler``, ``force_recover``, ``schedule_recovery``,
+``stats``, ``is_browser_healthy``, ``shutdown``, ``reset_instance``, ``_instance``,
 ``MAX_CONCURRENT_CONTEXTS``), ``get_browser_manager()`` and
 ``CHROMIUM_MEMORY_FLAGS``.
 
@@ -255,6 +255,14 @@ class BrowserManager:
                 "[BrowserManager] Relaunch after force recovery failed; "
                 "the next request will retry"
             )
+
+    def schedule_recovery(self, reason: str) -> None:
+        """Crash hook main.py calls on a BrowserCrashedError (503).
+
+        The open build has no background relaunch: ``ensure_browser_ready()``
+        relaunches a dead browser on the next slot acquisition.
+        """
+        logger.warning("[BrowserManager] Recovery requested: %s", reason)
 
     async def ensure_browser_ready(self) -> None:
         """Ensure the browser is connected, reinitializing if it is not."""

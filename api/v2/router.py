@@ -14,12 +14,14 @@ from .handlers.ingest import router as ingest_router
 from .handlers.lookup import router as lookup_router
 from .handlers.perceive import router as perceive_router
 from .handlers.perceive_status import router as perceive_status_router
+from .handlers.public_check import router as public_check_router
 from .handlers.watch import router as watch_router
 
 router = APIRouter()
 
 router.include_router(perceive_router, tags=["v2-perceive"])
 router.include_router(perceive_status_router, tags=["v2-perceive"])
+router.include_router(public_check_router, tags=["v2-public"])
 router.include_router(discover_router, tags=["v2-discover"])
 router.include_router(lookup_router, tags=["v2-lookup"])
 router.include_router(distill_router, tags=["v2-distill"])
@@ -38,6 +40,7 @@ def v2_info() -> dict:
             "perceive_status": "GET /v2/perceive/{operation_id}",
             "perceive_batch": "POST /v2/perceive/batch",
             "perceive_batch_status": "GET /v2/perceive/batch/{job_id}",
+            "public_check": "GET /v2/public/check/{operation_id}",
             "discover": "POST /v2/discover",
             "lookup": "POST /v2/lookup",
             "distill": "POST /v2/distill",

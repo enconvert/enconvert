@@ -8,6 +8,7 @@ from auth.jwt_handler import generate_jwt_token, generate_refresh_token, validat
 from config import WIDGET_ORIGIN
 from rate_limiting.limiter import enforce_ip
 from utils.subscription import is_project_owner_active
+from utils.client_ip import resolve_client_ip
 from utils.turnstile import verify_turnstile
 from utils.validators import is_domain_allowed
 
@@ -67,7 +68,7 @@ async def exchange_token(
                 status_code=400,
                 detail="Turnstile token required for widget-based requests"
             )
-        await verify_turnstile(body.turnstile_token, request.client.host if request.client else None)
+        await verify_turnstile(body.turnstile_token, resolve_client_ip(request))
         logger.info("Token exchange: turnstile verification passed")
         turnstile_verified = True
     else:

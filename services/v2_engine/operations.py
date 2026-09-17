@@ -44,6 +44,12 @@ BATCH_ZIP_KEY = "_batch_zip"
 HTTP_STATUS_KEY = "_http_status"
 DEDUCTIONS_KEY = "_deductions"
 
+# Reserved key inside output_keys: True on rows rendered by the anonymous
+# playground (perceive_flow.is_anonymous_playground). The unauthenticated
+# GET /v2/public/check/{id} shows only these rows — the founder's own sk_
+# reads live on the same admin project and must never be public.
+PUBLIC_KEY = "_public"
+
 CACHE_TTL_SECONDS = 3600  # plan section 4: 1 h TTL
 
 
@@ -250,12 +256,16 @@ def complete_operation(
     llm_input_tokens: int = 0,
     llm_output_tokens: int = 0,
     llm_cost_cents: Decimal = Decimal("0"),
+    is_blocked: bool = False,
+    is_login_wall: bool = False,
 ) -> None:
     """Mark the row completed with its artifacts and metadata.
 
     The llm_* fields (Task F.6) record what THIS operation spent on
     Tier-3 extraction; cache-hit completions keep the zero defaults —
-    serving from cache costs nothing new.
+    serving from cache costs nothing new. ``is_blocked`` /
+    ``is_login_wall`` persist the scorer's verdict so GET, cache hits
+    and the public permalink report the same flag the POST did.
     """
     db = get_db()
     try:
@@ -276,6 +286,8 @@ def complete_operation(
         op.cache_hit = cache_hit
         op.duration_ms = duration_ms
         op.render_quality_score = render_quality_score
+        op.is_blocked = is_blocked
+        op.is_login_wall = is_login_wall
         op.llm_input_tokens = llm_input_tokens
         op.llm_output_tokens = llm_output_tokens
         op.llm_cost_cents = llm_cost_cents

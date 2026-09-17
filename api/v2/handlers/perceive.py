@@ -45,6 +45,7 @@ from api.v2.handlers.perceive_status import (
 )
 from api.v2.schemas.perceive import ARTIFACT_OUTPUTS
 from monitoring.metrics import log_activity_start, update_activity_status
+from services.browser.converters.errors import ConversionError
 from services.v2_engine import batch_store, batch_worker, operations, perceive_flow
 from utils.error_capture import error_fields
 from utils.processor import validate_auth_cookies_headers
@@ -74,6 +75,25 @@ def _reject_unsupported(body: PerceiveOptionsBase) -> None:
             status_code=422,
             detail=f"Not yet supported: {', '.join(unsupported)}. "
             "These parameters arrive in an upcoming release.",
+        )
+
+
+def _reject_anonymous_options(body: PerceiveOptionsBase, user: dict) -> None:
+    """A playground (anonymous) render may not force a re-render or hold
+    the browser on a wait: cache_mode bypass/refresh and wait_for are for
+    keyed callers. 422 names the option so the widget can drop it."""
+    if not perceive_flow.is_anonymous_playground(user):
+        return
+    rejected = []
+    if body.cache_mode != "enabled":
+        rejected.append(f"cache_mode={body.cache_mode!r}")
+    if body.wait_for:
+        rejected.append("wait_for")
+    if rejected:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not available for anonymous playground renders: "
+            f"{', '.join(rejected)}. Use an API key for these options.",
         )
 
 
@@ -109,6 +129,7 @@ async def perceive(
     check_v2_feature(user, "perceive_enabled", "Perceive")
     check_ops_quota(user)
     _reject_unsupported(body)
+    _reject_anonymous_options(body, user)
     validate_auth_cookies_headers(
         {
             "auth": body.auth.model_dump() if body.auth else None,
@@ -137,6 +158,14 @@ async def perceive(
     try:
         response = await perceive_flow.run(body, operation_id, user)
     except HTTPException as exc:
+        await _mark_activity(activity_id, "Failed", start, error=exc)
+        raise
+    except ConversionError as exc:
+        # Typed render failures (browser crash -> 503 + Retry-After, target
+        # faults -> 502/504) are rendered by main.conversion_error_handler;
+        # flattening them to 500 would hide the retry signal. The handler
+        # sends operation_id as X-Operation-Id for support correlation.
+        exc.operation_id = operation_id
         await _mark_activity(activity_id, "Failed", start, error=exc)
         raise
     except Exception as exc:
@@ -185,7 +214,10 @@ async def perceive(
         "output_file_size_bytes": total_bytes,
         "direct_download": body.direct_download,
     }, source=posthog_client.source_from(user))
-    if body.direct_download:
+    # An unbilled read (block, HTTP error, login wall) has no artifact to
+    # stream; the JSON verdict (score, deductions, status_code) is the
+    # useful body, never a 404 for an empty file.
+    if body.direct_download and response.billed:
         return await stream_artifact(response)
     return response
 
@@ -205,6 +237,15 @@ async def perceive_batch(
     Gate order matters: nothing is persisted until every gate passed —
     a 403/402/422 must leave zero rows behind.
     """
+    # The playground never batches, and a queued batch is rebuilt without
+    # key_type (batch_worker._load_job), which would hand anonymous renders
+    # the stealth ladder and full budget on the single Chromium slot.
+    if perceive_flow.is_anonymous_playground(user):
+        raise HTTPException(
+            status_code=403,
+            detail="Batch is not available for anonymous playground "
+            "renders. Use an API key.",
+        )
     try:
         requests = batch_worker.build_requests(body)
     except ValidationError as exc:
