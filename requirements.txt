@@ -12,7 +12,14 @@ requests
 python-dateutil==2.9.0
 limits==5.8.0
 playwright==1.57.0
-playwright_stealth==2.0.0
+# The shared browser runs on patchright (crawl4ai UndetectedAdapter). Pinned so
+# its bundled Chromium revision (1228 = Chrome 149) matches the installed one:
+#   python -m patchright install chromium --no-shell
+patchright==1.61.2
+# ROLLBACK to stock Playwright + stealth: uncomment, pip install, and run
+#   python -m playwright install chromium
+# (crawl4ai 0.8.9 still pulls this in as a transitive dependency.)
+# playwright_stealth==2.0.0
 readability-lxml==0.8.1
 markdownify==0.14.1
 beautifulsoup4==4.12.3

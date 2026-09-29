@@ -16,11 +16,16 @@ from types import SimpleNamespace
 from typing import AsyncIterator, Iterable, Optional
 
 from services.browser.converters.browser_manager import BrowserManager
-from services.v2_engine import ingest_flow
+from services.v2_engine import ingest_flow, perceive_flow
 from services.v2_engine.chunking.semantic import chunk_markdown
+from services.v2_engine.quality import QUALITY_FLOOR
 
 # ingest_flow's discovery ceiling (its sitemap probe max and the schema cap).
 MAX_PAGES = 1000
+
+
+# Before/after samples on the demo page show at most this much of a page.
+SAMPLE_CHARS = 12_000
 
 
 @dataclass
@@ -33,6 +38,12 @@ class CrawledPage:
     render_quality: Optional[float] = None
     reason: str = ""
     chunks: list[dict] = field(default_factory=list)
+    # Raw HTML as fetched vs the clean Markdown ingest keeps: the demo's
+    # "what went in / what came out" panels and its noise-removed figure.
+    raw_chars: int = 0
+    clean_chars: int = 0
+    raw_sample: str = ""
+    clean_sample: str = ""
 
 
 async def discover_site(
@@ -43,6 +54,37 @@ async def discover_site(
     discovery = {"max_pages": min(max_pages, MAX_PAGES), "max_depth": max_depth}
     urls, _found, _truncated = await ingest_flow._discover_urls(job, discovery, {})
     return urls
+
+
+async def _render_page(url: str) -> tuple[str, str, str, str, float, str]:
+    """(html, final_url, markdown, title, render_quality, blocked_reason).
+
+    Mirrors ingest_flow._url_to_markdown step for step (browser render, the
+    QUALITY_FLOOR gate, the same Markdown pass) but also hands back the raw
+    HTML, which ingest discards. A blocked page returns its HTML with an
+    empty Markdown and the reason, instead of raising, so the demo can show
+    what the crawler was served.
+    """
+    rendered = await perceive_flow.render_html(url, allow_tls=False)
+    html = rendered.html or ""
+    final_url = rendered.final_url or url
+    quality = rendered.render_quality
+    if rendered.is_blocked or quality < QUALITY_FLOOR:
+        names = ", ".join(sorted(getattr(rendered, "deductions", None) or {}))
+        reason = (
+            f"the page could not be read (render_quality {quality:.2f}; "
+            f"{names or 'below quality floor'})"
+        )
+        return html, final_url, "", "", quality, reason
+    markdown = await asyncio.to_thread(
+        ingest_flow._markdown_for,
+        html,
+        final_url,
+        content_category=rendered.content_category,
+        content_type=rendered.content_type,
+    )
+    title = await asyncio.to_thread(ingest_flow._extract_title, html)
+    return html, final_url, markdown, title, quality, ""
 
 
 async def crawl_pages(
@@ -65,36 +107,36 @@ async def crawl_pages(
     try:
         for url in urls:
             try:
-                markdown, title, _src, final_url, quality = (
-                    await ingest_flow._url_to_markdown(SimpleNamespace(url=url), {}, {})
-                )
-                if not markdown.strip():
-                    raise ingest_flow.EmptyPageError(
-                        "the page returned no extractable content"
-                    )
-            except ingest_flow.EmptyPageError as exc:
-                yield CrawledPage(url=url, status="skipped", reason=str(exc))
-                continue
+                html, final_url, markdown, title, quality, blocked = await _render_page(url)
             except Exception as exc:  # one bad page never sinks the crawl
                 yield CrawledPage(
                     url=url, status="error", reason=f"{type(exc).__name__}: {exc}"
                 )
                 continue
 
-            content_hash = ingest_flow.content_fingerprint(markdown, final_url, url)
             page = CrawledPage(
                 url=url,
                 status="ok",
                 final_url=final_url,
                 title=title,
-                content_hash=content_hash,
-                render_quality=quality.get("render_quality"),
+                render_quality=quality,
+                raw_chars=len(html),
+                raw_sample=html[:SAMPLE_CHARS],
             )
-            if seen.contains(final_url, content_hash):
+            if blocked or not markdown.strip():
+                page.status = "skipped"
+                page.reason = blocked or "the page returned no extractable content"
+                yield page
+                continue
+
+            page.clean_chars = len(markdown)
+            page.clean_sample = markdown[:SAMPLE_CHARS]
+            page.content_hash = ingest_flow.content_fingerprint(markdown, final_url, url)
+            if seen.contains(final_url, page.content_hash):
                 page.status = "duplicate"
                 yield page
                 continue
-            seen.add(final_url, content_hash)
+            seen.add(final_url, page.content_hash)
             chunks = await asyncio.to_thread(
                 chunk_markdown, markdown, max_words=max_words
             )
