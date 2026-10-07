@@ -6,15 +6,16 @@ space, or the cloud metadata endpoint must be rejected before it ever
 reaches the browser (project security rules: "block private/internal
 IPs" on URL conversion).
 
-DNS rebinding + redirects (hardening sprint): the guard resolves the
-hostname here, but the browser resolves it AGAIN at navigation, so a
-hostile DNS server (or a 30x to an internal address) could diverge. The
-browser render path now installs a per-request route guard
-(``is_host_public`` via browser_manager) that RE-VALIDATES every
-navigated/subresource host at request time, closing that window for the
-Chromium path; the TLS/HTTP rung pins the validated IP. A bare
+DNS rebinding + redirects: the guard resolves the hostname here, but a
+fetcher that resolves it AGAIN (or follows a 30x to an internal address)
+could diverge. The Chromium render path runs behind a loopback egress proxy
+(services/browser/egress_guard.py) that re-validates EVERY connection the
+browser makes — documents, iframes, native redirect hops, subresources,
+WebSockets — with ``pinned_public_ips`` and connects to the validated
+address itself; the TLS/HTTP rung pins the validated IP too. A bare
 ``assert_public_http_url`` caller that does its own fetch without those
-guards still carries the original TOCTOU.
+guards still carries the original TOCTOU. (``make_ssrf_route_handler``
+below is kept for the open-source mirror build, which has no egress proxy.)
 
 A configurable local threat policy (services/v2_engine/threat_policy.py)
 is enforced at this same choke point — a denylist of domains/TLDs/host
@@ -59,7 +60,12 @@ _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 
 def _is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True when the address is not publicly routable."""
+    """True when the address is not publicly routable.
+
+    ``not is_global`` also catches ranges the named predicates miss, e.g.
+    CGNAT 100.64.0.0/10 (used by Tailscale / carrier NAT) and the IETF
+    documentation / benchmarking blocks.
+    """
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     return (
@@ -69,6 +75,7 @@ def _is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
+        or not ip.is_global
     )
 
 
@@ -171,6 +178,51 @@ async def assert_public_http_url(url: str) -> None:
                 detail="URLs resolving to private or internal addresses "
                 "are not allowed.",
             )
+
+
+async def pinned_public_ips(host: str) -> list[str]:
+    """Every address ``host`` resolves to, if ALL are safe to connect to.
+
+    The browser egress guard's check (services/browser/egress_guard.py):
+    the same rules as ``assert_public_http_url`` — blocked hostnames, the
+    local threat policy, non-standard numeric notation, and every resolved
+    address public — but it returns the validated addresses (IPv4 first) so
+    the caller connects to exactly these and never resolves again (pinning,
+    which closes the DNS-rebind window). Returns [] for anything that must
+    not be fetched; never raises.
+    """
+    hostname = host.strip().strip("[]").rstrip(".").lower()
+    if not hostname or hostname in _BLOCKED_HOSTNAMES:
+        return []
+    try:
+        threat_policy.assert_allowed(f"http://{hostname}/", hostname)
+    except HTTPException:
+        return []
+    try:
+        ips = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        labels = hostname.split(".")
+        if all(_NUMERIC_LABEL_RE.fullmatch(label) for label in labels):
+            return []
+        try:
+            addresses = await _resolve_host(hostname)
+        except OSError:
+            return []
+        ips = []
+        for address in addresses:
+            try:
+                ips.append(ipaddress.ip_address(address.split("%", 1)[0]))
+            except ValueError:
+                return []  # unparseable answer: fail closed
+    if not ips or any(_is_forbidden_ip(ip) for ip in ips):
+        return []
+    # Return an IPv4-mapped IPv6 answer as the IPv4 it denotes, so the caller
+    # compares and connects to exactly the address that was checked.
+    canonical = {
+        ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped else ip
+        for ip in ips
+    }
+    return [str(ip) for ip in sorted(canonical, key=lambda ip: ip.version)]
 
 
 async def public_ip_for_host(host: str) -> str | None:

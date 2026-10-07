@@ -373,7 +373,12 @@ async def _gather_crawl_urls_js(
     ``_gather_crawl_urls`` so the output flows into the shared ``_finalize_urls``
     pass. Every followed link is SSRF-screened before it is rendered.
     """
-    from services.browser.converters.arun_flow import arun_with_watchdog
+    from services.browser.converters.arun_flow import (
+        RequestPageState,
+        arun_with_watchdog,
+        hook_session,
+        make_on_page_context_created,
+    )
     from services.browser.converters.browser_manager import get_browser_manager
 
     urls: list[str] = []
@@ -411,13 +416,25 @@ async def _gather_crawl_urls_js(
                 continue
             try:
                 async with browser_manager.crawler_slot() as crawler:
-                    # Watchdog-bounded: a wedged render recovers the browser
-                    # instead of holding the slot; the except below treats it
-                    # like any other failed render (RenderWatchdogTimeout is
-                    # a RuntimeError).
-                    result = await arun_with_watchdog(
-                        crawler, browser_manager, url=candidate, config=run_config
-                    )
+                    # Same per-page identity, CSP bypass and cookie cleanup as
+                    # every other render (page session opened in this hook).
+                    state = RequestPageState()
+                    hooks = {
+                        "on_page_context_created": make_on_page_context_created(
+                            state,
+                            viewport_width=1920,
+                            viewport_height=1080,
+                            cookies=None,
+                        )
+                    }
+                    async with hook_session(crawler.crawler_strategy, hooks, state):
+                        # Watchdog-bounded: a wedged render recovers the
+                        # browser instead of holding the slot; the except
+                        # below treats it like any other failed render
+                        # (RenderWatchdogTimeout is a RuntimeError).
+                        result = await arun_with_watchdog(
+                            crawler, browser_manager, url=candidate, config=run_config
+                        )
             except Exception as exc:  # noqa: BLE001 — one bad render != fatal
                 warnings.append(f"js render failed for {candidate}: {exc}")
                 continue

@@ -239,7 +239,7 @@ async def perceive_batch(
     """
     # The playground never batches, and a queued batch is rebuilt without
     # key_type (batch_worker._load_job), which would hand anonymous renders
-    # the stealth ladder and full budget on the single Chromium slot.
+    # the full ladder budget on the single Chromium slot.
     if perceive_flow.is_anonymous_playground(user):
         raise HTTPException(
             status_code=403,

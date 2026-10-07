@@ -37,6 +37,9 @@ pandas==2.3.3
 markdown==3.10
 weasyprint==65.1
 crawlee[parsel,playwright]==1.0.*
+# Direct import in services/browser/page_session.py (top document's site);
+# also pulled in by crawlee. 5.3+ for top_domain_under_public_suffix.
+tldextract==5.3.*
 toml==0.10.2
 Pillow==11.2.1
 cairosvg==2.9.0
