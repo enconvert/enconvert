@@ -14,6 +14,28 @@ family from having to import the anything-to-pdf package to name its own error.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def unoconvert_failed(stderr: str, ext: str, target: str) -> ValueError:
+    """Build the client-facing 400 for a failed ``unoconvert`` run.
+
+    On failure unoconvert prints the unoserver client's whole Python traceback,
+    temp-file paths included. That text used to be returned verbatim as the 400
+    detail to every API, SDK, n8n and MCP caller, so it stays in the server log
+    and the caller gets one plain sentence instead.
+    """
+    logger.warning("unoconvert %s -> %s failed: %s", ext, target, stderr.strip())
+    kind = ext.lstrip(".").upper() or "document"
+    if "Could not load document" in stderr:
+        return ValueError(
+            f"The {kind} file could not be opened. It may be corrupt or "
+            "password-protected."
+        )
+    return ValueError(f"The {kind} file could not be converted to {target}.")
+
 
 class UnsupportedOptionError(ValueError):
     """Raised for a pdf_option the engine for this input cannot honor.

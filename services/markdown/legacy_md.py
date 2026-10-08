@@ -17,7 +17,7 @@ import os
 import subprocess
 import tempfile
 
-from services.conversion_errors import ConversionTimeoutError
+from services.conversion_errors import ConversionTimeoutError, unoconvert_failed
 
 from .common import decode_text_bytes
 from .html_md import html_to_markdown
@@ -46,8 +46,7 @@ def legacy_office_to_markdown(file_bytes: bytes, original_filename: str) -> str:
             timeout=_UNOCONVERT_TIMEOUT_S,
         )
         if result.returncode != 0:
-            detail = result.stderr.strip() or "unoserver conversion failed"
-            raise ValueError(f"Document conversion failed: {detail}")
+            raise unoconvert_failed(result.stderr or "", ext, "Markdown")
 
         with open(output_path, "rb") as handle:
             html = decode_text_bytes(handle.read())

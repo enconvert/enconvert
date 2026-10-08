@@ -2,7 +2,7 @@ import tempfile
 import subprocess
 import os
 
-from services.conversion_errors import ConversionTimeoutError
+from services.conversion_errors import ConversionTimeoutError, unoconvert_failed
 
 _UNOCONVERT_TIMEOUT_S = 120
 
@@ -30,8 +30,7 @@ def convert_to_pdf(
     try:
         result=subprocess.run(["unoconvert","--convert-to", "pdf", temp_file_path, output_file_path], capture_output=True , text=True , timeout=_UNOCONVERT_TIMEOUT_S)
         if result.returncode !=0:
-            error_message=result.stderr.strip() or "unoserver conversion failed"
-            raise ValueError(f"Document Conversion Failed:{error_message}")
+            raise unoconvert_failed(result.stderr or "", ext, "PDF")
         with open(output_file_path,"rb") as f:
             return f.read()
     except subprocess.TimeoutExpired as exc:

@@ -74,8 +74,11 @@ async def convert_to_grayscale(pdf_bytes: bytes) -> bytes:
             raise
 
         if proc.returncode != 0:
-            error_msg = stderr.decode(errors="replace").strip()
-            raise RuntimeError(f"Ghostscript grayscale conversion failed: {error_msg}")
+            # The 500 handler echoes str(e) to the caller; gs stderr names temp paths.
+            logger.warning(
+                "Ghostscript grayscale failed: %s", stderr.decode(errors="replace").strip()
+            )
+            raise RuntimeError("Grayscale conversion failed")
 
         return out_path.read_bytes()
     finally:
